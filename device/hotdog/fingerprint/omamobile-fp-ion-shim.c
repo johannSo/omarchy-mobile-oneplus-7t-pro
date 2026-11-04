@@ -162,6 +162,10 @@ static struct heap heaps[MAX_HEAPS];
 static int heap_count;
 static bool legacy_abi;
 static const char *qseecom_path = "/dev/qseecom";
+/* RPMB (see rpmb_ioctl()): the node's path and the UFS fields librpmb reads */
+static const char *rpmb_path;
+static int ufs_sub_class, ufs_rpmb_rw = 0x40;
+static long long ufs_rpmb_blocks;
 
 static void configure(void)
 {
@@ -171,6 +175,15 @@ static void configure(void)
 
 	if (q && *q)
 		qseecom_path = q;
+	{
+		const char *r = getenv("OMAMOBILE_FP_RPMB_SG");
+		const char *u = getenv("OMAMOBILE_FP_UFS_DESC");
+
+		if (r && *r)
+			rpmb_path = r;
+		if (u)
+			sscanf(u, "%i,%i,%lli", &ufs_sub_class, &ufs_rpmb_rw, &ufs_rpmb_blocks);
+	}
 	legacy_abi = abi && !strcmp(abi, "legacy");
 	if (s && *s) {
 		char copy[256], *save = NULL, *item;
@@ -293,6 +306,192 @@ static bool is_ion_path(const char *path)
 	return path && !strcmp(path, "/dev/ion");
 }
 
+/*
+ * RPMB for qseecomd's librpmb (FINGERPRINT-PLAN F7, the owner's decision).
+ * librpmb finds UFS RPMB as a SCSI generic node: it scans /dev for sg%d,
+ * asks SCSI_IOCTL_GET_IDLUN for the well-known LU 0xC4 (LU byte 0x44),
+ * reads three UFS descriptors with downstream's UFS_IOCTL_QUERY, then sends
+ * SECURITY PROTOCOL IN/OUT with SG_IO (v3). The host loads no sg driver:
+ * that would give every LU a raw node past the storage guard. The runner
+ * binds only the RPMB LU's bsg node in as OMAMOBILE_FP_RPMB_SG (/dev/sg0),
+ * and this shim speaks for it: SG_IO v3 becomes bsg's v4 on the same fd,
+ * GET_IDLUN answers LU 0x44, and the query answers the three fields
+ * librpmb reads (device bDeviceSubClass, geometry bRPMB_ReadWriteSize,
+ * the RPMB unit's qLogicalBlockCount) from OMAMOBILE_FP_UFS_DESC, which the
+ * runner reads from the kernel's sysfs. Nothing else reaches the device.
+ */
+#define MAX_RPMB_FDS	8
+static int rpmb_fds[MAX_RPMB_FDS];
+
+static bool is_rpmb_path(const char *path)
+{
+	return rpmb_path && path && !strcmp(path, rpmb_path);
+}
+
+static void rpmb_track(int fd)
+{
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < MAX_RPMB_FDS; i++)
+		if (!rpmb_fds[i]) {
+			rpmb_fds[i] = fd;
+			break;
+		}
+	pthread_mutex_unlock(&lock);
+}
+
+static bool is_rpmb_fd(int fd, bool forget)
+{
+	bool found = false;
+
+	if (fd <= 0)
+		return false;
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < MAX_RPMB_FDS; i++)
+		if (rpmb_fds[i] == fd) {
+			found = true;
+			if (forget)
+				rpmb_fds[i] = 0;
+			break;
+		}
+	pthread_mutex_unlock(&lock);
+	return found;
+}
+
+struct sg_io_v3 {
+	int interface_id;
+	int dxfer_direction;
+	unsigned char cmd_len;
+	unsigned char mx_sb_len;
+	unsigned short iovec_count;
+	unsigned int dxfer_len;
+	void *dxferp;
+	unsigned char *cmdp;
+	void *sbp;
+	unsigned int timeout;
+	unsigned int flags;
+	int pack_id;
+	void *usr_ptr;
+	unsigned char status;
+	unsigned char masked_status;
+	unsigned char msg_status;
+	unsigned char sb_len_wr;
+	unsigned short host_status;
+	unsigned short driver_status;
+	int resid;
+	unsigned int duration;
+	unsigned int info;
+};
+
+struct sg_io_v4_ {
+	int32_t guard;
+	uint32_t protocol, subprotocol, request_len;
+	uint64_t request, request_tag;
+	uint32_t request_attr, request_priority, request_extra, max_response_len;
+	uint64_t response;
+	uint32_t dout_iovec_count, dout_xfer_len, din_iovec_count, din_xfer_len;
+	uint64_t dout_xferp, din_xferp;
+	uint32_t timeout, flags;
+	uint64_t usr_ptr;
+	uint32_t spare_in, driver_status, transport_status, device_status, retry_delay, info,
+		duration, response_len;
+	int32_t din_resid, dout_resid;
+	uint64_t generated_tag;
+	uint32_t spare_out, padding;
+};
+
+#define SG_IO_			0x2285
+#define SCSI_IOCTL_GET_IDLUN_	0x5382
+#define UFS_IOCTL_QUERY_	0x5388
+
+static int rpmb_ioctl(int fd, unsigned int request, void *arg)
+{
+	REAL(ioctl_fn, ioctl);
+
+	if (request == SCSI_IOCTL_GET_IDLUN_) {
+		uint32_t *idlun = (uint32_t *)arg;
+
+		idlun[0] = 0x44 << 8;	/* id 0, LU 0xC444 & 0xff, channel 0, host 0 */
+		idlun[1] = 0;
+		return 0;
+	}
+	if (request == UFS_IOCTL_QUERY_) {
+		uint8_t *q = (uint8_t *)arg;
+		uint32_t opcode;
+		uint16_t size;
+		uint8_t *buf = q + 8;
+
+		memcpy(&opcode, q, 4);
+		memcpy(&size, q + 6, 2);
+		if (opcode != 1 || size > 0x100) {	/* READ_DESC only */
+			say("rpmb: UFS query opcode %u idn %u refused", opcode, q[4]);
+			errno = EINVAL;
+			return -1;
+		}
+		memset(buf, 0, size);
+		switch (q[4]) {
+		case 0:		/* device: bDeviceSubClass */
+			if (size > 4)
+				buf[4] = (uint8_t)ufs_sub_class;
+			break;
+		case 7:		/* geometry: bRPMB_ReadWriteSize */
+			if (size > 0x17)
+				buf[0x17] = (uint8_t)ufs_rpmb_rw;
+			break;
+		case 2:		/* the RPMB unit: bLogicalBlockSize, qLogicalBlockCount */
+			if (size > 0x12) {
+				buf[0x0a] = 8;
+				for (int i = 0; i < 8; i++)
+					buf[0x0b + i] = (uint8_t)(ufs_rpmb_blocks >> (56 - 8 * i));
+			}
+			break;
+		default:
+			say("rpmb: UFS descriptor %u refused", q[4]);
+			errno = EINVAL;
+			return -1;
+		}
+		return 0;
+	}
+	if (request == SG_IO_) {
+		struct sg_io_v3 *h = (struct sg_io_v3 *)arg;
+		struct sg_io_v4_ v = {};
+		int ret;
+
+		if (h->interface_id != 'S' || h->iovec_count) {
+			errno = EINVAL;
+			return -1;
+		}
+		v.guard = 'Q';
+		v.request_len = h->cmd_len;
+		v.request = (uintptr_t)h->cmdp;
+		v.max_response_len = h->mx_sb_len;
+		v.response = (uintptr_t)h->sbp;
+		v.timeout = h->timeout;
+		if (h->dxfer_direction == -2) {		/* SG_DXFER_TO_DEV */
+			v.dout_xfer_len = h->dxfer_len;
+			v.dout_xferp = (uintptr_t)h->dxferp;
+		} else if (h->dxfer_direction == -3 || h->dxfer_direction == -4) {
+			v.din_xfer_len = h->dxfer_len;
+			v.din_xferp = (uintptr_t)h->dxferp;
+		}
+		ret = real_ioctl(fd, SG_IO_, &v);
+		if (ret < 0)
+			return ret;
+		h->status = (unsigned char)v.device_status;
+		h->masked_status = (unsigned char)((v.device_status >> 1) & 0x7f);
+		h->msg_status = 0;
+		h->sb_len_wr = (unsigned char)v.response_len;
+		h->host_status = (unsigned short)v.transport_status;
+		h->driver_status = (unsigned short)v.driver_status;
+		h->resid = v.din_xfer_len ? v.din_resid : v.dout_resid;
+		h->duration = v.duration;
+		h->info = (v.device_status || v.transport_status || v.driver_status) ? 1 : 0;
+		return 0;
+	}
+	say("rpmb: ioctl 0x%x refused", request);
+	errno = ENOTTY;
+	return -1;
+}
+
 /* /dev/ion -> /dev/qseecom, through the real open, then tracked. */
 static int open_ion(int flags)
 {
@@ -318,6 +517,17 @@ static int open_ion(int flags)
 
 /* --- interposed entry points --- */
 
+/* the fd of an open of the RPMB node, remembered for rpmb_ioctl() */
+static int rpmb_opened(const char *path, int fd)
+{
+	pthread_once(&configured, configure);
+	if (fd >= 0 && is_rpmb_path(path)) {
+		rpmb_track(fd);
+		say("rpmb: %s opened (the RPMB well-known LU's bsg node)", path);
+	}
+	return fd;
+}
+
 EXPORT int open(const char *path, int flags, ...)
 {
 	REAL(open_fn, open);
@@ -332,7 +542,7 @@ EXPORT int open(const char *path, int flags, ...)
 	}
 	if (is_ion_path(path))
 		return open_ion(flags);
-	return real_open(path, flags, mode);
+	return rpmb_opened(path, real_open(path, flags, mode));
 }
 
 EXPORT int open64(const char *path, int flags, ...)
@@ -364,7 +574,7 @@ EXPORT int openat(int dirfd, const char *path, int flags, ...)
 	/* an absolute path ignores dirfd, as the kernel does */
 	if (is_ion_path(path))
 		return open_ion(flags);
-	return real_openat(dirfd, path, flags, mode);
+	return rpmb_opened(path, real_openat(dirfd, path, flags, mode));
 }
 
 EXPORT int openat64(int dirfd, const char *path, int flags, ...)
@@ -388,7 +598,7 @@ EXPORT int __open_2(const char *path, int flags)
 
 	if (is_ion_path(path))
 		return open_ion(flags);
-	return real___open_2(path, flags);
+	return rpmb_opened(path, real___open_2(path, flags));
 }
 
 EXPORT int __openat_2(int dirfd, const char *path, int flags)
@@ -397,7 +607,7 @@ EXPORT int __openat_2(int dirfd, const char *path, int flags)
 
 	if (is_ion_path(path))
 		return open_ion(flags);
-	return real___openat_2(dirfd, path, flags);
+	return rpmb_opened(path, real___openat_2(dirfd, path, flags));
 }
 
 EXPORT int close(int fd)
@@ -410,6 +620,7 @@ EXPORT int close(int fd)
 		for (int i = 0; i < n; i++)
 			real_close(bufs[i]);
 	}
+	(void)is_rpmb_fd(fd, true);
 	return real_close(fd);
 }
 
@@ -583,5 +794,69 @@ EXPORT int ioctl(int fd, unsigned long request, ...)
 
 	if (_IOC_TYPE((unsigned int)request) == ION_MAGIC && is_ion_fd(fd))
 		return ion_ioctl(fd, (unsigned int)request, arg);
+	if (is_rpmb_fd(fd, false))
+		return rpmb_ioctl(fd, (unsigned int)request, arg);
 	return real_ioctl(fd, (int)request, arg);
+}
+
+/*
+ * Privilege drops: qseecomd (and the vendor's other daemons) switch to an
+ * Android user (setgid, setuid, capset) after their start. Our device
+ * nodes are the host's (root, 0600: /dev/qseecom, the binderfs nodes),
+ * with no Android ueventd to make them system:drmrpc 0660, so the dropped
+ * daemon could open none of them and aborted. Every process here stays
+ * root, as in the Pixel stack's chroot: it sees only the nodes the runner
+ * binds in, and qcom_qseecom_compat decides what reaches the secure world.
+ */
+static void drop_ignored(const char *what)
+{
+	static bool told;
+
+	if (!told) {
+		told = true;
+		say("%s ignored: the stack stays root in its chroot", what);
+	}
+}
+
+EXPORT int setuid(uid_t uid) { (void)uid; drop_ignored("setuid"); return 0; }
+EXPORT int setgid(gid_t gid) { (void)gid; drop_ignored("setgid"); return 0; }
+EXPORT int setresuid(uid_t r, uid_t e, uid_t s) { (void)r; (void)e; (void)s; drop_ignored("setresuid"); return 0; }
+EXPORT int setresgid(gid_t r, gid_t e, gid_t s) { (void)r; (void)e; (void)s; drop_ignored("setresgid"); return 0; }
+EXPORT int setgroups(size_t n, const gid_t *list) { (void)n; (void)list; drop_ignored("setgroups"); return 0; }
+EXPORT int capset(void *hdr, const void *data) { (void)hdr; (void)data; drop_ignored("capset"); return 0; }
+
+/*
+ * librpmb chowns its sg node to system (1000) after finding it. Here that
+ * node is the host's bsg node for RPMB, bind-mounted in: a chown would
+ * hand the host's RPMB to uid 1000 (the desktop user). Ownership changes
+ * under /dev are ignored; everything here runs as root anyway.
+ */
+typedef int (*chown_fn)(const char *, uid_t, gid_t);
+typedef int (*fchownat_fn)(int, const char *, uid_t, gid_t, int);
+
+EXPORT int chown(const char *path, uid_t uid, gid_t gid)
+{
+	REAL(chown_fn, chown);
+
+	if (path && !strncmp(path, "/dev/", 5))
+		return 0;
+	return real_chown(path, uid, gid);
+}
+
+EXPORT int lchown(const char *path, uid_t uid, gid_t gid)
+{
+	REAL(chown_fn, lchown);
+
+	if (path && !strncmp(path, "/dev/", 5))
+		return 0;
+	return real_lchown(path, uid, gid);
+}
+
+EXPORT int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags)
+{
+	REAL(fchownat_fn, fchownat);
+
+	if (path && !strncmp(path, "/dev/", 5))
+		return 0;
+	return real_fchownat(dirfd, path, uid, gid, flags);
 }

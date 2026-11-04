@@ -15,9 +15,13 @@
 #   omamobile-fp-hotdog-chroot run CMD...     an Android binary in the chroot
 #
 # STAGE (each includes the ones before):
-#   listeners  hwservicemanager, qseecomd (QSEE's listener services)
-#   hal        + OnePlus's Goodix fingerprint HAL (it loads its TA in QSEE)
-#   bridge     + omamobile-fp-hotdog-bridge, fprintd's way in (default)
+#   listeners  servicemanager, vndservicemanager, hwservicemanager, qseecomd
+#              (QSEE's listener services)
+#   hal        + OnePlus's HIDL fingerprint service, which opens the Goodix
+#              HAL module (it loads its TA in QSEE): a HAL-only test
+#   bridge     + omamobile-fp-hotdog-bridge (default), which opens the same
+#              HAL module itself, in place of the HIDL service (never both:
+#              they would share /dev/goodix_fp and the TA)
 # OMAMOBILE_FP_KEYS=1 also starts the QSEE keymaster and gatekeeper HALs
 # before the HAL. Off by default: their first run provisions keys in the
 # secure world, the human's call (FINGERPRINT-PLAN).
@@ -72,12 +76,18 @@ GATEKEEPER=/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti
 # (informational: setup() binds all of vendor/, and vendor/firmware_mnt at
 # /firmware too)
 TA_DIRS="/vendor/firmware_mnt/image /vendor/firmware"
-# The bridge's options; the sensor circle is a placeholder until the
-# plan's calibration step (x,y,r in panel pixels).
-SENSOR=${OMAMOBILE_FP_SENSOR:-720,2700,110}
+# The bridge's options. The sensor circle in panel pixels (x,y,r): LineageOS's
+# hotdog BoardConfig.mk (lineage-18.1) gives the in-screen sensor's top-left
+# 610,2618 and size 220, so its centre is 720,2728
+SENSOR=${OMAMOBILE_FP_SENSOR:-720,2728,110}
 PANEL=1440x3120
 HBM_FIRST=${OMAMOBILE_FP_HBM_FIRST:-0}
-HAT_MODE=${OMAMOBILE_FP_HAT_MODE:-zero}
+HAT_MODE=${OMAMOBILE_FP_HAT_MODE:-gatekeeper}
+# libQSEEComAPI allocates from qsecom (27) and qsecom_ta (19); OnePlus's
+# HAL also takes 4 MiB from the secure carve-out heap (14, flag CP_CDSP)
+# in CaEntry::startTap and fails its start without it. All three come from
+# the qseecom carve-out (libgf_ud_hal's carveoutIonInit, FINGERPRINT-PLAN)
+ION_HEAPS=${OMAMOBILE_FP_ION_HEAPS:-qsecom:27,qsecom_ta:19,secure_carveout:14}
 
 STATE=/var/lib/omamobile-fp-hotdog
 RUN=/run/omamobile-fp-hotdog
@@ -154,7 +164,7 @@ stop() {
   stop_children 100 fingerprint
   stop_children 50 gatekeeper keymaster
   stop_children 50 qseecomd
-  stop_children 30 hwservicemanager
+  stop_children 30 hwservicemanager vndservicemanager servicemanager
   kill -TERM 0 2>/dev/null || true
   exit "$code"
 }
@@ -166,10 +176,10 @@ touch_event() {
   done
 }
 
-# The panel driver's hbm attribute (the backlight device of the DSI panel)
+# The panel driver's hbm attribute (on the DSI panel device, the backlight's parent)
 hbm_attr() {
   local f
-  for f in /sys/class/backlight/*/hbm; do
+  for f in /sys/class/backlight/*/device/hbm /sys/bus/mipi-dsi/devices/*/hbm; do
     [[ -f $f ]] && { echo "$f"; return; }
   done
 }
@@ -183,6 +193,22 @@ notify_attr() {
 }
 
 param() { cat "$MODPARAMS/$1" 2>/dev/null || true; }
+
+# The UFS RPMB well-known LU (0xC4, SCSI LU 49476) and its bsg node, only
+# when the owner allowed RPMB; and the descriptor fields librpmb reads
+RPMB_BSG= UFS_DESC=
+rpmb_setup() {
+  local sd ufs
+  [[ $(param allow_rpmb) == Y && -e $CONSENT_RPMB ]] || return 0
+  for sd in /sys/class/scsi_device/*:49476; do
+    [[ -e $sd ]] || continue
+    [[ -c /dev/bsg/${sd##*/} ]] && RPMB_BSG=/dev/bsg/${sd##*/}
+  done
+  [[ -n $RPMB_BSG ]] || die "allow_rpmb=Y, but no bsg node for the RPMB LU (49476)"
+  for ufs in /sys/bus/platform/devices/*.ufshc; do :; done
+  UFS_DESC="$(cat "$ufs/device_descriptor/device_sub_class"),$(cat "$ufs/geometry_descriptor/rpmb_rw_size"),$(cat "/sys/class/scsi_device/${RPMB_BSG##*/}/device/unit_descriptor/logical_block_count")"
+  say "RPMB allowed (the owner's decision): $RPMB_BSG, UFS $UFS_DESC"
+}
 
 check() {
   local ok=1 apps rpmb
@@ -256,6 +282,24 @@ setup_sys() {
   mkdir -p "$sys/omamobile"
   [[ -n $HBM_ATTR ]] && bind "$HBM_ATTR" "$sys/omamobile/hbm"
   [[ -n $NOTIFY_ATTR ]] && bind "$NOTIFY_ATTR" "$sys/omamobile/fp_notify"
+  # What OnePlus's HAL reads around every capture (traced on the phone):
+  # the display's AOD state (0: off) and its dim-layer node, which it
+  # writes (a dummy here: the shell dims the screen itself). Not the
+  # battery temperature (/sys/class/power_supply/battery/temp): with the
+  # real 32 C the algorithm's exposure left most captures too dark to
+  # preprocess under our light (5 of ~40 enrolled), at its 0 C default
+  # 20 of 20 (2026-11-04). OMAMOBILE_FP_BATTERY_TEMP=1 binds it anyway.
+  local bat="" f disp=$sys/devices/platform/soc/ae00000.qcom,mdss_mdp/drm/card0/card0-DSI-1
+  if [[ ${OMAMOBILE_FP_BATTERY_TEMP:-0} == 1 ]]; then
+    for f in /sys/class/power_supply/*; do
+      [[ $(cat "$f/type" 2>/dev/null) == Battery && -r $f/temp ]] && { bat=$f/temp; break; }
+    done
+    [[ -n $bat ]] && bind "$bat" "$sys/class/power_supply/battery/temp" ro
+  fi
+  echo 0 > "$RUN/aod"
+  : > "$RUN/notify_dim"
+  bind "$RUN/aod" "$disp/aod" ro
+  bind "$RUN/notify_dim" "$disp/notify_dim"
   mount -o remount,ro "$sys"
 }
 
@@ -268,7 +312,21 @@ setup_dev() {
   # no /dev/ion: the ion shim answers it from /dev/qseecom
   ev=$(touch_event)
   [[ -n $ev ]] && bind "/dev/input/$ev" "$dev/input/touchscreen" ro
-  # no /dev/block, no /dev/sg*, no /dev/bsg: nothing in here reaches storage
+  # No block device, no sg node, no ufs-bsg: no partition is reachable from
+  # here. qseecomd starts no listener at all unless its SSD service opens
+  # the ssd partition: it gets a private file under that name instead
+  # (setup_ssd). /dev/block/bootdevice is a link with "ufshc" in it, as on
+  # stock, which is how librpmb tells UFS from eMMC.
+  mkdir -p "$dev/block/platform/soc/1d84000.ufshc/by-name"
+  bind "$STATE/ssd.img" "$dev/block/platform/soc/1d84000.ufshc/by-name/ssd"
+  ln -s platform/soc/1d84000.ufshc "$dev/block/bootdevice"
+  # RPMB, only with the owner's decision (allow_rpmb=Y and $CONSENT_RPMB,
+  # check): the RPMB well-known LU's bsg node alone, as /dev/sg0, which the
+  # hotdog shim speaks sg for (omamobile-fp-ion-shim.c, rpmb_ioctl)
+  if [[ -n $RPMB_BSG ]]; then
+    bind "$RPMB_BSG" "$dev/sg0"
+    say "RPMB: $RPMB_BSG as /dev/sg0"
+  fi
   mkdir -p "$dev/socket" "$dev/binderfs"
   install -d -m 0700 "$SOCKDIR"
   bind "$SOCKDIR" "$dev/socket/omamobile-fp"
@@ -300,7 +358,26 @@ setup_data() {
   bind "$STATE/persist" "$ROOT/mnt/vendor/persist"
 }
 
+# The SSD listener's partition, as a private file on userdata: seeded once
+# from a read-only copy of the real ssd partition (found by PARTNAME, which
+# the storage guard keeps read-only), so the real one is never written
+setup_ssd() {
+  local f part=""
+  [[ -s $STATE/ssd.img ]] && return 0
+  install -d -m 0700 "$STATE"
+  for f in /sys/class/block/*; do
+    grep -qx PARTNAME=ssd "$f/uevent" 2>/dev/null && part=${f##*/}
+  done
+  [[ -n $part && -b /dev/$part ]] || die "no ssd partition to copy"
+  [[ $(cat "/sys/class/block/$part/ro") == 1 ]] || die "ssd ($part) is writable: the storage guard is not running"
+  dd if="/dev/$part" of="$STATE/ssd.img.new" bs=4096 status=none
+  chmod 0600 "$STATE/ssd.img.new"
+  mv "$STATE/ssd.img.new" "$STATE/ssd.img"
+  say "ssd: private copy of $part ($(stat -c %s "$STATE/ssd.img") bytes)"
+}
+
 setup() {
+  setup_ssd
   mkdir -p "$ROOT"
   mount -t tmpfs -o mode=0755,nosuid omamobile-fp-hotdog "$ROOT"
   for d in system vendor; do bind "$IMAGE/$d" "$ROOT/$d" ro; done
@@ -321,8 +398,12 @@ setup() {
   setup_data
 }
 
-LIBS_VENDOR=/vendor/lib64:/vendor/lib64/hw:/system/lib64
-LIBS_SYSTEM=/system/lib64:/vendor/lib64
+# Android 10's linker namespaces, flattened: a vendor process takes the
+# platform's libraries from VNDK-SP and VNDK first, and the runtime APEX
+# (libandroidicu, which libsqlite and libxml2 need) comes last
+RUNTIME_LIBS=/apex/com.android.runtime/lib64
+LIBS_VENDOR=/vendor/lib64:/vendor/lib64/hw:/system/lib64/vndk-sp-29:/system/lib64/vndk-29:/system/lib64:$RUNTIME_LIBS
+LIBS_SYSTEM=/system/lib64:/vendor/lib64:$RUNTIME_LIBS
 spawn() {
   local name=$1 kind=$2; shift 2
   local libs=$LIBS_VENDOR
@@ -334,7 +415,8 @@ spawn() {
     OMAMOBILE_FP_PROPS=/dev/__omamobile_props__ \
     OMAMOBILE_FP_LOGLEVEL="${OMAMOBILE_FP_LOGLEVEL:-3}" \
     ${OMAMOBILE_FP_ION_ABI:+OMAMOBILE_FP_ION_ABI="$OMAMOBILE_FP_ION_ABI"} \
-    ${OMAMOBILE_FP_ION_HEAPS:+OMAMOBILE_FP_ION_HEAPS="$OMAMOBILE_FP_ION_HEAPS"} \
+    OMAMOBILE_FP_ION_HEAPS="$ION_HEAPS" \
+    ${RPMB_BSG:+OMAMOBILE_FP_RPMB_SG=/dev/sg0 OMAMOBILE_FP_UFS_DESC="$UFS_DESC"} \
     ANDROID_ROOT=/system ANDROID_DATA=/data \
     "$CHROOT_BIN" "$ROOT" "$@" > >(sed -u "s/^/[$name] /") 2>&1 &
   PIDS[$name]=$!
@@ -386,10 +468,15 @@ start() {
   awk '/^NSpid:/ {print $2}' /proc/self/status > "$NSPID"
   trap 'stop 0' TERM INT
   trap 'stop $?' EXIT
+  rpmb_setup
   setup
   # a bridge that died with the panel lit leaves no HBM behind
   [[ -n $HBM_ATTR ]] && echo 0 > "$HBM_ATTR" 2>/dev/null || true
 
+  # The vendor's libraries register binder services (the Goodix daemon,
+  # OnePlus's extension), and libbinder waits for a service manager
+  spawn servicemanager system /system/bin/servicemanager
+  spawn vndservicemanager vendor /vendor/bin/vndservicemanager /dev/vndbinder
   spawn hwservicemanager system /system/bin/hwservicemanager
   sleep 1
   # qseecomd registers its listeners with QSEE, then sets this property
@@ -407,12 +494,12 @@ start() {
 
   if [[ $stage == hal || $stage == bridge ]]; then
     [[ -c $ROOT/dev/goodix_fp ]] || die "no /dev/goodix_fp in the chroot"
-    spawn fingerprint vendor "$FP_HAL"
   fi
+  [[ $stage == hal ]] && spawn fingerprint vendor "$FP_HAL"
 
   if [[ $stage == bridge ]]; then
-    # the system search order: the bridge links the platform's libhidlbase
-    spawn bridge system /omamobile/omamobile-fp-hotdog-bridge \
+    # the vendor search order: the bridge dlopens the vendor's HAL module
+    spawn bridge vendor /omamobile/omamobile-fp-hotdog-bridge \
       --socket /dev/socket/omamobile-fp/bridge.sock --touch /dev/input/touchscreen \
       --state /data/vendor/omamobile-fp \
       --hbm /sys/omamobile/hbm --notify /sys/omamobile/fp_notify \
@@ -444,6 +531,7 @@ run() {
     env -i LD_LIBRARY_PATH=$LIBS_VENDOR \
     LD_PRELOAD="/omamobile/omamobile-fp-shim.so /omamobile/omamobile-fp-ion-shim.so" \
     OMAMOBILE_FP_PROPS=/dev/__omamobile_props__ OMAMOBILE_FP_LOGLEVEL=2 \
+    OMAMOBILE_FP_ION_HEAPS="$ION_HEAPS" \
     "$CHROOT_BIN" "$ROOT" "$@"
 }
 
