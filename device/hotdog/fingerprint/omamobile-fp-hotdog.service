@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT
+# OnePlus's Goodix fingerprint HAL, QSEE's listener daemon (qseecomd) and
+# omamobile-fp-hotdog-bridge in a minimal chroot, for fprintd's
+# omamobile_udfps driver (device/hotdog/FINGERPRINT-PLAN.md).
+#
+# STAGED, THEORETICAL: shipped by no package and enabled nowhere, so it has
+# no [Install] section on purpose. Installing it (the files under
+# /usr/lib/omamobile-fp-hotdog, this unit) and starting it by hand is a
+# runbook step of the plan, the human's call: its first start loads a
+# trusted app into QSEE and lets it write its own files on userdata.
+#
+# One start per boot: QSEE keeps a loaded app and its listeners until a
+# reboot. So there is no Restart=, the runner refuses a second start until a
+# reboot, and a failed unit stays failed: the lock screen uses the PIN.
+[Unit]
+Description=Omarchy Mobile fingerprint, OnePlus 7T Pro (vendor HAL and bridge)
+Documentation=file:///usr/share/doc/omamobile/hotdog-FINGERPRINT-PLAN.md
+After=systemd-modules-load.service
+ConditionPathExists=/usr/lib/omamobile-fp-hotdog/root
+ConditionPathExists=/dev/qseecom
+
+[Service]
+# goodix-fp and the qseecom compat driver are not autoloaded; the runner
+# refuses unless qcom_qseecom_compat's app_allowlist names the trusted app
+# (set by the human, FINGERPRINT-PLAN).
+ExecStartPre=/usr/bin/modprobe goodix-fp
+ExecStart=/usr/lib/omamobile-fp-hotdog/omamobile-fp-hotdog-chroot start bridge
+# TERM to the runner only: it stops the bridge (HBM off), the HAL, then
+# qseecomd; whatever is left after the timeout gets KILL.
+KillMode=mixed
+TimeoutStopSec=30
+Restart=no
+# The desktop's fingerprint target follows this file; a stack killed
+# outright cannot remove it itself.
+ExecStopPost=-/usr/bin/rm -f /run/omamobile-fp-ui/state.json
