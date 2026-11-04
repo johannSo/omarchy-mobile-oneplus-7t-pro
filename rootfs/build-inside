@@ -12,7 +12,8 @@
 # package ships boot files, so linux-omamobile and omamobile-boot-update go
 # in and the package's modules replace the tarball), KERNEL_RELEASE, MODULES_SHA256,
 # GIT_COMMIT, ALARM_SHA256, OMARCHY_CHANNEL, CHANNEL ([omamobile]: stable,
-# development or local).
+# development or local), LOCAL_KEY (with local: the public key that signed
+# the repository, under /src).
 set -euo pipefail
 
 T=/target
@@ -191,6 +192,20 @@ grep -q '^alarm:' "$T/etc/passwd" && die "an alarm account in the image"
 awk -F: '$3 >= 1000 && $3 != 65534 {print $1}' "$T/etc/passwd" | grep -q . && die "a user account in the image"
 sed -i 's/^root:[^:]*:/root:!*:/' "$T/etc/shadow"
 rm -rf "$T/etc/pacman.d/gnupg"                 # firstboot makes the phone's own keyring
+# A local channel's repository is signed with the contributor's local key,
+# which the build trusts only in its own keyring (removed above). Ship it as
+# a keyring of its own, so firstboot's pacman-key --populate trusts it on
+# the phone too; without it every refresh failed at [omamobile] with "key
+# ... is unknown", and omarchy update with it (hotdog, 2026-11-04).
+if [[ $CHANNEL == local && -n ${LOCAL_KEY:-} ]]; then
+  [[ -f $LOCAL_KEY ]] || die "no local key $LOCAL_KEY"
+  fpr=$(gpg --show-keys --with-colons "$LOCAL_KEY" 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}')
+  [[ $fpr =~ ^[0-9A-F]{40}$ ]] || die "no key fingerprint in $LOCAL_KEY"
+  install -Dm644 "$LOCAL_KEY" "$T/usr/share/pacman/keyrings/omamobile-local.gpg"
+  printf '%s:4:\n' "$fpr" > "$T/usr/share/pacman/keyrings/omamobile-local-trusted"
+  chmod 644 "$T/usr/share/pacman/keyrings/omamobile-local-trusted"
+  echo "    local key shipped as a keyring: $fpr"
+fi
 rm -f "$T"/etc/ssh/ssh_host_*                  # sshd makes the phone's own host keys
 printf 'uninitialized\n' > "$T/etc/machine-id" # systemd makes the phone's own id
 rm -f "$T/var/lib/systemd/random-seed" "$T/var/lib/dbus/machine-id"

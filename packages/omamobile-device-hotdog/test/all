@@ -1,0 +1,34 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# omamobile-device-hotdog: the scripts parse, every wants link has its unit,
+# the modem services never run read-write, and a staged install holds what
+# the phone needs.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+for f in build install bin/*; do bash -n "$f"; done
+echo "ok - scripts parse"
+for l in vendor/systemd/system/*.wants/*; do
+  [[ -f vendor/systemd/system/$(basename "$(readlink "$l")") ]] || { echo "not ok - $l has no unit"; exit 1; }
+done
+echo "ok - wants links"
+grep -cx 'ExecStart=/usr/lib/omamobile/hotdog/rmtfs -r -P -s' vendor/systemd/system/omamobile-rmtfs.service >/dev/null ||
+  { echo "not ok - rmtfs must run read-only (-r)"; exit 1; }
+echo "ok - rmtfs read-only"
+for p in modemst1 modemst2 fsg fsc oem_stanvbk oem_dycnvbk persist; do
+  grep -c "|$p|\|\"$p|\||$p\"" vendor/udev/rules.d/10-omamobile-storage.rules >/dev/null ||
+    { echo "not ok - $p is not set read-only by udev"; exit 1; }
+done
+echo "ok - NV partitions read-only"
+stage=$(mktemp -d) build=$(mktemp -d)
+trap 'rm -rf "$stage" "$build"' EXIT
+: > "$build/rmtfs"; : > "$build/tqftpserv"
+./install "$stage" "$build" >/dev/null
+for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/bin/omamobile-hotdog-bt-addr \
+    usr/lib/systemd/system/multi-user.target.wants/omamobile-rmtfs.service \
+    usr/lib/udev/rules.d/10-omamobile-storage.rules etc/pacman.d/omamobile-mirrorlist \
+    "usr/share/alsa/ucm2/conf.d/sm8150/OnePlus 7T Pro.conf" usr/share/alsa/ucm2/OnePlus/hotdog/HiFi.conf; do
+  [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
+done
+[[ $(readlink "$stage/etc/systemd/system/ModemManager.service") == /dev/null ]] || { echo "not ok - ModemManager not masked"; exit 1; }
+[[ $(readlink "$stage/etc/systemd/system/systemd-firstboot.service") == /dev/null ]] || { echo "not ok - systemd-firstboot not masked"; exit 1; }
+echo "ok - staged install"
