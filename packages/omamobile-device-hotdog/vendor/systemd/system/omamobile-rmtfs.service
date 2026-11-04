@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# OnePlus 7T Pro: the modem's remote file system, read-only. rmtfs serves
+# the modem's EFS (modemst1, modemst2, fsg, fsc and OnePlus's oem_stanvbk and
+# oem_dycnvbk) from /dev/disk/by-partlabel (-P) and starts the modem
+# remoteproc once its service is up (-s). With -r every partition is read
+# into RAM when the modem opens it, and the modem's writes only change that
+# copy: Linux never writes the modem's NV partitions (AGENTS.md §1), and the
+# storage guard and 10-omamobile-storage.rules keep them read-only in the
+# kernel as well. The Wi-Fi firmware runs on the modem, so Wi-Fi needs this.
+[Unit]
+Description=Qualcomm remote file system for the modem (read-only)
+After=systemd-udev-settle.service systemd-modules-load.service
+
+[Service]
+ExecStart=/usr/lib/omamobile/hotdog/rmtfs -r -P -s
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -361,8 +361,15 @@ say "ready"
     echo
     echo "=== USB never configured; dmesg follows ==="
     dmesg | grep -iE 'dwc3|phy|usb|udc|clk|error|fail' | tail -30
-    echo "omamobile: no USB host, crashing in 20 s so ABL falls back to slot A"
   } > $SCREEN
+  # A phone with no stock slot to fall back to (the descriptor's
+  # USB_HOST_PANIC=0) would only restart into this same image: keep running
+  # and leave the log on the screen
+  if [ -f /etc/omamobile-no-usb-panic ]; then
+    say "no USB host; staying up (no fallback slot)"
+    exit 0
+  fi
+  echo "omamobile: no USB host, crashing in 20 s so ABL falls back to slot A" > $SCREEN
   sleep 20
   # Never in the middle of growing the root file system (boot_arch)
   while [ -e /run/omamobile-resizing ]; do sleep 1; done

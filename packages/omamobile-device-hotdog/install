@@ -1,0 +1,36 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage omamobile-device-hotdog into DESTDIR. Never activates anything by
+# itself: the units are enabled by vendor wants links.
+#   ./install DESTDIR [BUILDDIR]   (BUILDDIR holds rmtfs and tqftpserv)
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+destination=${1:?Usage: ./install DESTDIR [BUILDDIR]}
+build=${2:-build}
+[[ $destination == /* && $destination != "/" ]] || { echo "Use an absolute staging directory" >&2; exit 1; }
+for file in bin/*; do install -Dm755 "$file" "$destination/usr/bin/${file##*/}"; done
+for tool in rmtfs tqftpserv; do install -Dm755 "$build/$tool" "$destination/usr/lib/omamobile/hotdog/$tool"; done
+while IFS= read -r -d '' file; do
+  install -Dm644 "$file" "$destination/usr/lib/${file#vendor/}"
+done < <(find vendor -type f -print0)
+while IFS= read -r -d '' file; do
+  install -d "$destination/usr/lib/$(dirname "${file#vendor/}")"
+  ln -sfn "$(readlink "$file")" "$destination/usr/lib/${file#vendor/}"
+done < <(find vendor -type l -print0)
+while IFS= read -r -d '' file; do
+  install -Dm644 "$file" "$destination/usr/share/alsa/${file}"
+done < <(find ucm2 -type f -print0)
+# The modem stays off the network: ModemManager would turn the radio on, and
+# on this phone that crashed the modem into a SoC crash dump (owner's rule:
+# the radio goes on only with the owner's explicit yes)
+install -d "$destination/etc/systemd/system"
+ln -sfn /dev/null "$destination/etc/systemd/system/ModemManager.service"
+# systemd-firstboot prompts for locale, keymap, timezone and root password on
+# the console, which is the panel here (console=tty0) and has no keyboard;
+# it runs before sysinit.target, so it held sshd and omamobile-firstboot
+# (H3, 2026-11-04). omamobile-firstboot sets all of that from firstboot.conf.
+ln -sfn /dev/null "$destination/etc/systemd/system/systemd-firstboot.service"
+install -Dm644 etc/omamobile-mirrorlist "$destination/etc/pacman.d/omamobile-mirrorlist"
+install -Dm644 LICENSE "$destination/usr/share/licenses/omamobile-device-hotdog/LICENSE"
+install -Dm644 LICENSE.Apache-2.0 "$destination/usr/share/licenses/omamobile-device-hotdog/LICENSE.Apache-2.0"
+install -Dm644 version "$destination/usr/share/omamobile/device-hotdog/version"
