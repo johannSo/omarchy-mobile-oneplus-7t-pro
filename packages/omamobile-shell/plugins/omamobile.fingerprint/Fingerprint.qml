@@ -92,6 +92,12 @@ Item {
   property var sensor: null
   readonly property bool active: SensorModel.active(sensor)
   readonly property bool fingerDown: !!sensor && sensor.finger
+  // An optical sensor sees the finger by the light of the pixels under it.
+  // Where the panel can't light them itself (no LHBM: the OnePlus 7T Pro),
+  // the shell draws a white disc there while a finger is down; the bridge
+  // has turned the panel's HBM on by then.
+  readonly property bool illuminate: fingerDown && !!sensor && sensor.illuminate
+  readonly property bool dimLight: Quickshell.env("OMAMOBILE_FP_DIM") === "1"
 
   // Shown while active, and for a moment after: between a failed match and
   // fprintd's next attempt the bridge is idle for a few hundred ms, and the
@@ -264,6 +270,43 @@ Item {
   readonly property string checkGlyph: String.fromCodePoint(0xF012C)         // nf-md-check
   readonly property string alertGlyph: String.fromCodePoint(0xF0026)         // nf-md-alert
 
+  // ---------------------------------------------------------------- the light
+
+  // Without LHBM (illuminate) the sensor sees the finger by the white disc
+  // under it while HBM is on. Stock dims everything else then (the HAL's
+  // notify_dim: its display driver lays a dark layer over the screen), so
+  // the rest of the HBM-bright screen doesn't flood the optical sensor with
+  // stray light. This does the same: the whole screen nearly black, the
+  // disc white, no input (touches go on to the target and the bridge).
+  PanelWindow {
+    id: light
+
+    screen: root.panelScreen
+    // mapped for the whole operation, so a touch only repaints it (a new
+    // surface per touch would come too late for the capture). OFF for now:
+    // with the screen dimmed only 7 of 43 enrollment captures passed the
+    // TA's preprocessing, with the disc alone (the target's) 20 of 20
+    // (2026-11-04); dimLight turns it back on to experiment
+    visible: root.dimLight && root.shown && root.spot !== null && !!root.sensor && root.sensor.illuminate
+    anchors { top: true; bottom: true; left: true; right: true }
+    exclusionMode: ExclusionMode.Ignore
+    color: root.illuminate ? Qt.rgba(0, 0, 0, 0.92) : "transparent"
+    WlrLayershell.namespace: "omamobile-fingerprint"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    mask: Region {}
+
+    Rectangle {
+      x: root.spot ? root.spot.x - width / 2 : 0
+      y: root.spot ? root.spot.y - height / 2 : 0
+      width: root.spot ? root.spot.r * 2.2 : 0
+      height: width
+      radius: width / 2
+      color: "white"
+      visible: root.illuminate
+    }
+  }
+
   // ---------------------------------------------------------------- the target
 
   PanelWindow {
@@ -299,6 +342,16 @@ Item {
         anchors.fill: parent
         acceptedButtons: Qt.AllButtons
         preventStealing: true
+      }
+
+      // the light for an optical sensor without LHBM (see illuminate)
+      Rectangle {
+        anchors.centerIn: parent
+        width: root.spot ? root.spot.r * 2.2 : 0
+        height: width
+        radius: width / 2
+        color: "white"
+        visible: root.illuminate
       }
 
       Item {
@@ -705,6 +758,17 @@ Item {
               ctx.stroke()
             }
           }
+        }
+
+        // the light for an optical sensor without LHBM (see illuminate)
+        Rectangle {
+          anchors.centerIn: parent
+          width: screenBody.sr * 2.2
+          height: width
+          radius: width / 2
+          color: "white"
+          visible: root.illuminate
+          z: 2
         }
 
         // the circle itself, as the target draws it
