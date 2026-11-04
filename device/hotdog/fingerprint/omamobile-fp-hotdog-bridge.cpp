@@ -62,22 +62,19 @@
  * panel driver turns it off by itself 3 s after the last write (the bridge
  * refreshes it every 2 s while the finger stays).
  *
- * The hw_auth_token (--hat-mode): on Android Gatekeeper signs it with the
- * key keystore agreed at boot. The HAL's TA may refuse anything else, and
- * then enrollment cannot work until "gatekeeper" exists:
+ * The hw_auth_token (--hat-mode), enroll()'s proof that the user just
+ * confirmed their credential. On Android Gatekeeper signs it with the
+ * auth-token key of QSEE's keymaster app, and OnePlus's HAL hands that
+ * key to the fingerprint TA at start (fetchHmacKeyFromKeyMaster,
+ * sendHmacKey), so the TA checks the HMAC:
  *
- *  - zero (default): version 0, the preEnroll challenge, user 0,
- *    authenticator 0, type password, the time, an all-zero HMAC. Some
- *    vendor TAs accept that when no key agreement happened; VERIFY on this
- *    TA (an enroll() that returns an error, or ERROR 2 at once, is the
- *    refusal).
- *  - gatekeeper: TODO. The QSEE Gatekeeper HAL
- *    (android.hardware.gatekeeper@1.0, its TA in QSEE) would enroll a
- *    random secret of the bridge once (STATE/secret, as the Pixel bridge
- *    does with Trusty's Gatekeeper) and verify() it with the challenge for
- *    a signed token. Not implemented: it needs the QSEE keymaster and
- *    gatekeeper TAs running, and their first run provisions keys in the
- *    secure world (the human's call, FINGERPRINT-PLAN).
+ *  - gatekeeper (default): QSEE's Gatekeeper signs it (gk_token(), below);
+ *    the key itself never leaves QSEE (keymaster hands it to the TA only
+ *    encapsulated, 152 bytes). The desktop's own unlock (fprintd's enroll
+ *    needs the user's session) stands in for the password Gatekeeper
+ *    would have checked on Android.
+ *  - zero: the same token with an all-zero HMAC, for a TA that does not
+ *    check it.
  *
  * RESETLOCKOUT: HIDL 2.1 has no resetLockout; the HAL's timed lockout
  * (ERROR_LOCKOUT, 30 s on AOSP) ends on its own. The bridge answers
@@ -91,14 +88,19 @@
  * plan's calibration step and pass --sensor X,Y,R; until then a finger may
  * miss the sensor while the bridge thinks it is on it.
  *
- * C++ on the vendor's libhidlbase, built against an AOSP tree (the system
- * libc++, std::__1, as the chroot's libraries): see Makefile here.
+ * No HIDL in the end: OnePlus's android.hardware.biometrics.fingerprint@2.1-
+ * service is only a wrapper around the legacy HAL module (its
+ * hw_get_module("goodix.fod"), open(module, NULL), version 0x201 and the
+ * standard fingerprint_device_t offsets, read from its disassembly), so
+ * the bridge loads hw/goodix.fod.msmnile.so itself and calls the same
+ * functions in the same order; the "HIDL 2.1" calls above are its device
+ * functions (pre_enroll, enroll, ...). No hwservicemanager, and no system
+ * libc++ objects cross into the vendor's code, so the NDK builds it (its
+ * static libc++) against the chroot's libc and libdl. The module's
+ * callbacks come on the HAL's own threads, into the same event pipe.
  */
 
-#include <android/hardware/biometrics/fingerprint/2.1/IBiometricsFingerprint.h>
-#include <android/hardware/biometrics/fingerprint/2.1/IBiometricsFingerprintClientCallback.h>
-#include <hidl/HidlTransportSupport.h>
-
+#include <dlfcn.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -106,6 +108,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,19 +121,78 @@
 #include <time.h>
 #include <unistd.h>
 
-using android::sp;
-using android::hardware::hidl_array;
-using android::hardware::hidl_death_recipient;
-using android::hardware::hidl_string;
-using android::hardware::hidl_vec;
-using android::hardware::Return;
-using android::hardware::Void;
-using android::hardware::biometrics::fingerprint::V2_1::FingerprintAcquiredInfo;
-using android::hardware::biometrics::fingerprint::V2_1::FingerprintError;
-using android::hardware::biometrics::fingerprint::V2_1::IBiometricsFingerprint;
-using android::hardware::biometrics::fingerprint::V2_1::IBiometricsFingerprintClientCallback;
-using android::hardware::biometrics::fingerprint::V2_1::RequestStatus;
-using android::hidl::base::V1_0::IBase;
+/*
+ * The legacy HAL ABI on arm64 (libhardware's hw_module_t/hw_device_t and
+ * fingerprint.h, module API 2.1), written out here because the NDK has no
+ * libhardware headers. Offsets: notify 0x78, set_notify 0x80 ... the
+ * service calls set_notify at 0x80 and set_active_group at 0xc0.
+ */
+struct hw_module_t;
+struct hw_device_t;
+struct hw_module_methods_t {
+	int (*open)(const struct hw_module_t *module, const char *id, struct hw_device_t **device);
+};
+struct hw_module_t {
+	uint32_t tag;
+	uint16_t module_api_version;
+	uint16_t hal_api_version;
+	const char *id;
+	const char *name;
+	const char *author;
+	struct hw_module_methods_t *methods;
+	void *dso;
+	uint64_t reserved[32 - 7];
+};
+struct hw_device_t {
+	uint32_t tag;
+	uint32_t version;
+	struct hw_module_t *module;
+	uint64_t reserved[12];
+	int (*close)(struct hw_device_t *device);
+};
+static_assert(sizeof(struct hw_device_t) == 0x78, "hw_device_t");
+
+#define FINGERPRINT_MODULE_API_VERSION_2_1	0x201
+#define HAT_SIZE	69
+
+enum fp_msg_type {
+	FP_ERROR = -1, FP_ACQUIRED = 1, FP_TEMPLATE_ENROLLING = 3, FP_TEMPLATE_REMOVED = 4,
+	FP_AUTHENTICATED = 5, FP_TEMPLATE_ENUMERATING = 6,
+};
+#define FP_ERROR_VENDOR_BASE	1000
+#define FP_ACQUIRED_VENDOR_BASE	1000
+struct fp_finger_id { uint32_t gid, fid; };
+struct fp_msg {
+	int32_t type;
+	union {
+		int32_t error;
+		struct { struct fp_finger_id finger; uint32_t samples_remaining; uint64_t msg; } enroll;
+		struct { struct fp_finger_id finger; uint32_t remaining_templates; } iter;
+		struct { int32_t acquired_info; } acquired;
+		struct { struct fp_finger_id finger; uint8_t hat[HAT_SIZE]; } authenticated;
+	} data;
+};
+typedef void (*fp_notify_t)(const struct fp_msg *msg);
+struct fingerprint_device_t {
+	struct hw_device_t common;
+	fp_notify_t notify;
+	int (*set_notify)(struct fingerprint_device_t *dev, fp_notify_t notify);
+	uint64_t (*pre_enroll)(struct fingerprint_device_t *dev);
+	int (*enroll)(struct fingerprint_device_t *dev, const uint8_t *hat, uint32_t gid,
+		      uint32_t timeout_sec);
+	int (*post_enroll)(struct fingerprint_device_t *dev);
+	uint64_t (*get_authenticator_id)(struct fingerprint_device_t *dev);
+	int (*cancel)(struct fingerprint_device_t *dev);
+	int (*enumerate)(struct fingerprint_device_t *dev);
+	int (*remove)(struct fingerprint_device_t *dev, uint32_t gid, uint32_t fid);
+	int (*set_active_group)(struct fingerprint_device_t *dev, uint32_t gid, const char *path);
+	int (*authenticate)(struct fingerprint_device_t *dev, uint64_t operation_id, uint32_t gid);
+	void *reserved[4];
+};
+static_assert(offsetof(struct fingerprint_device_t, set_notify) == 0x80, "set_notify");
+static_assert(offsetof(struct fingerprint_device_t, set_active_group) == 0xc0, "set_active_group");
+
+static const char *module_path = "/vendor/lib64/hw/goodix.fod.msmnile.so";
 
 /* The protocol's codes: android.hardware.biometrics.fingerprint (AIDL) Error */
 #define ERR_HW_UNAVAILABLE	1
@@ -155,16 +217,19 @@ static const char *inhibit_dir;		/* --inhibit: off unless given */
 /* From the HBM write to a lit frame: the panel's command takes a frame or
  * two at 60 Hz (stock waits 12-16 ms inside the sequence). Tuned in the
  * plan. */
-static int hbm_settle_ms = 60;
+static int hbm_settle_ms = 150;
 /* --hbm-first 1: HBM before touchdown */
 static bool hbm_first;
+/* --illuminate 0|1: the panel has no LHBM, so the shell must draw the
+ * light under the finger (a white disc, omamobile.fingerprint); default on */
+static bool illuminate = true;
 /* The panel driver turns HBM off 3 s after the last write. */
 #define HBM_REFRESH_MS	2000
 /* PLACEHOLDERS until the plan's calibration step (--sensor X,Y,R). */
 static int32_t sensor_x = 720, sensor_y = 2700, sensor_r = 110;
 static int32_t panel_w = 1440, panel_h = 3120;
 enum hat_mode { HAT_ZERO, HAT_GATEKEEPER };
-static enum hat_mode hat_mode = HAT_ZERO;
+static enum hat_mode hat_mode = HAT_GATEKEEPER;
 static uint32_t enroll_timeout_s = 60;
 
 /* --- logging --- */
@@ -213,111 +278,130 @@ static void post(const struct event &e)
 	(void)!write(events[1], &e, sizeof(e));
 }
 
-/* HIDL 2.1 FingerprintAcquiredInfo -> AIDL AcquiredInfo (the protocol's):
- * GOOD 0..TOO_FAST 5 are AIDL 1..6, VENDOR 6 is AIDL 7. */
-static int32_t acquired_code(FingerprintAcquiredInfo info)
+/* Legacy acquired_info -> AIDL AcquiredInfo (the protocol's): GOOD 0..
+ * TOO_FAST 5 are AIDL 1..6; VENDOR_BASE + n is AIDL VENDOR 7, vendor n. */
+static void acquired_code(int32_t v, int32_t *code, int32_t *vendor)
 {
-	int32_t v = static_cast<int32_t>(info);
-
-	return v >= 0 && v <= 6 ? v + 1 : 0;
-}
-
-/* HIDL 2.1 FingerprintError -> AIDL Error, LOCKOUT apart (-1 here). */
-static int32_t error_code(FingerprintError error)
-{
-	switch (error) {
-	case FingerprintError::ERROR_HW_UNAVAILABLE: return 1;
-	case FingerprintError::ERROR_UNABLE_TO_PROCESS: return 2;
-	case FingerprintError::ERROR_TIMEOUT: return 3;
-	case FingerprintError::ERROR_NO_SPACE: return 4;
-	case FingerprintError::ERROR_CANCELED: return 5;
-	case FingerprintError::ERROR_UNABLE_TO_REMOVE: return 6;
-	case FingerprintError::ERROR_LOCKOUT: return -1;
-	case FingerprintError::ERROR_VENDOR: return ERR_VENDOR;
-	default: return ERR_UNABLE_TO_PROCESS;
+	*vendor = 0;
+	if (v >= FP_ACQUIRED_VENDOR_BASE) {
+		*code = 7;
+		*vendor = v - FP_ACQUIRED_VENDOR_BASE;
+	} else {
+		*code = v >= 0 && v <= 5 ? v + 1 : 0;
 	}
 }
 
-struct Callback : public IBiometricsFingerprintClientCallback {
-	Return<void> onEnrollResult(uint64_t, uint32_t fingerId, uint32_t,
-				    uint32_t remaining) override
-	{
-		post({ EV_ENROLL, (int32_t)fingerId, (int32_t)remaining, 0 });
-		return Void();
-	}
-	Return<void> onAcquired(uint64_t, FingerprintAcquiredInfo info,
-				int32_t vendorCode) override
-	{
-		post({ EV_ACQUIRED, acquired_code(info), vendorCode, 0 });
-		return Void();
-	}
-	/* fingerId 0: a finger that matched none. The token would unlock
-	 * keystore keys on Android; nothing here needs it. */
-	Return<void> onAuthenticated(uint64_t, uint32_t fingerId, uint32_t,
-				     const hidl_vec<uint8_t> &token) override
-	{
-		post({ EV_AUTHENTICATED, (int32_t)fingerId, (int32_t)token.size(), 0 });
-		return Void();
-	}
-	Return<void> onError(uint64_t, FingerprintError error, int32_t vendorCode) override
-	{
-		post({ EV_ERROR, error_code(error), vendorCode, 0 });
-		return Void();
-	}
-	Return<void> onRemoved(uint64_t, uint32_t fingerId, uint32_t,
-			       uint32_t remaining) override
-	{
-		post({ EV_REMOVED, (int32_t)fingerId, (int32_t)remaining, 0 });
-		return Void();
-	}
-	Return<void> onEnumerate(uint64_t, uint32_t fingerId, uint32_t,
-				 uint32_t remaining) override
-	{
-		post({ EV_ENUMERATE, (int32_t)fingerId, (int32_t)remaining, 0 });
-		return Void();
-	}
-};
-
-/* A dead HAL ends the bridge, and the runner stops the stack (one start
- * per boot: a reboot starts it again). */
-struct Death : public hidl_death_recipient {
-	void serviceDied(uint64_t, const android::wp<IBase> &) override
-	{
-		say("the fingerprint HAL died");
-		_exit(3);
-	}
-};
-
-static sp<IBiometricsFingerprint> hal;
-/* held for the bridge's life: the HAL's death notice and our callback */
-static sp<Death> death;
-static sp<Callback> callback;
-
-/* A failed HIDL transport is a dead or wedged HAL: end, as above. */
-template <typename T> static T checked(const Return<T> &ret, const char *what)
+/* Legacy error -> AIDL Error, LOCKOUT apart (-1 here); the numbers 1-6
+ * are the same, LOCKOUT is 7, VENDOR_BASE + n is a vendor error. */
+static void error_code(int32_t error, int32_t *code, int32_t *vendor)
 {
-	if (!ret.isOk()) {
-		say("%s: transport failed (%s)", what, ret.description().c_str());
-		exit(3);
+	*vendor = 0;
+	if (error >= FP_ERROR_VENDOR_BASE) {
+		*code = ERR_VENDOR;
+		*vendor = error - FP_ERROR_VENDOR_BASE;
+	} else if (error == 7) {
+		*code = -1;
+	} else {
+		*code = error >= 1 && error <= 6 ? error : ERR_UNABLE_TO_PROCESS;
 	}
-	return ret;
 }
 
-static bool request_ok(const Return<RequestStatus> &ret, const char *what)
+/* The module's callback, on one of its threads. fid 0 on authenticated: a
+ * finger that matched none. The token would unlock keystore keys on
+ * Android; nothing here needs it. */
+static void on_notify(const struct fp_msg *m)
 {
-	RequestStatus status = checked<RequestStatus>(ret, what);
+	struct event e = {};
 
-	if (status != RequestStatus::SYS_OK) {
-		say("%s: %d", what, static_cast<int32_t>(status));
+	switch (m->type) {
+	case FP_TEMPLATE_ENROLLING:
+		e = { EV_ENROLL, (int32_t)m->data.enroll.finger.fid,
+		      (int32_t)m->data.enroll.samples_remaining, 0 };
+		break;
+	case FP_ACQUIRED:
+		e.code = EV_ACQUIRED;
+		acquired_code(m->data.acquired.acquired_info, &e.a, &e.b);
+		break;
+	case FP_AUTHENTICATED:
+		e = { EV_AUTHENTICATED, (int32_t)m->data.authenticated.finger.fid, HAT_SIZE, 0 };
+		break;
+	case FP_ERROR:
+		e.code = EV_ERROR;
+		error_code(m->data.error, &e.a, &e.b);
+		break;
+	case FP_TEMPLATE_REMOVED:
+		e = { EV_REMOVED, (int32_t)m->data.iter.finger.fid,
+		      (int32_t)m->data.iter.remaining_templates, 0 };
+		break;
+	case FP_TEMPLATE_ENUMERATING:
+		e = { EV_ENUMERATE, (int32_t)m->data.iter.finger.fid,
+		      (int32_t)m->data.iter.remaining_templates, 0 };
+		break;
+	default:
+		say("HAL message type %d ignored", m->type);
+		return;
+	}
+	post(e);
+}
+
+static struct fingerprint_device_t *hal;
+
+/* The HAL's device functions answer 0 for success. A HAL that crashes
+ * takes the bridge with it (one process), and the runner stops the stack
+ * (one start per boot: a reboot starts it again). */
+static bool request_ok(int ret, const char *what)
+{
+	if (ret) {
+		say("%s: %d", what, ret);
 		return false;
 	}
+	return true;
+}
+
+/* The module, as the service opens it: dlopen, HMI, open(module, NULL). */
+static bool open_hal(void)
+{
+	void *dso = dlopen(module_path, RTLD_NOW);
+	struct hw_module_t *module;
+	struct hw_device_t *device = NULL;
+	int ret;
+
+	if (!dso) {
+		say("dlopen %s: %s", module_path, dlerror());
+		return false;
+	}
+	module = (struct hw_module_t *)dlsym(dso, "HMI");
+	if (!module || !module->methods || !module->methods->open) {
+		say("%s: no HAL module (HMI)", module_path);
+		return false;
+	}
+	module->dso = dso;
+	say("module %s \"%s\" by %s, api %#x", module->id ? module->id : "?",
+	    module->name ? module->name : "?", module->author ? module->author : "?",
+	    module->module_api_version);
+	ret = module->methods->open(module, NULL, &device);
+	if (ret || !device) {
+		say("open: %d", ret);
+		return false;
+	}
+	if (device->version != FINGERPRINT_MODULE_API_VERSION_2_1) {
+		say("device version %#x, expected %#x", device->version,
+		    FINGERPRINT_MODULE_API_VERSION_2_1);
+		return false;
+	}
+	hal = (struct fingerprint_device_t *)device;
+	/* as the service does once the module is open */
+	void *cutils = dlopen("libcutils.so", RTLD_NOW);
+	int (*set_prop)(const char *, const char *) =
+		cutils ? (int (*)(const char *, const char *))dlsym(cutils, "property_set") : NULL;
+	if (!set_prop || set_prop("persist.vendor.oem.fp.version", "4"))
+		say("persist.vendor.oem.fp.version: not set");
 	return true;
 }
 
 /* --- the hw_auth_token --- */
 
 /* hw_auth_token_t: packed, 69 bytes; type and timestamp big-endian */
-#define HAT_SIZE	69
 #define HW_AUTH_PASSWORD 1
 
 static void put_be(uint8_t *p, uint64_t v, int bytes)
@@ -332,12 +416,186 @@ static void put_le64(uint8_t *p, uint64_t v)
 		p[i] = (uint8_t)v;
 }
 
-static bool make_hat(uint64_t challenge, hidl_array<uint8_t, HAT_SIZE> &hat)
-{
-	uint8_t *p = hat.data();
+/*
+ * --hat-mode gatekeeper: a token signed in QSEE, as on Android. The
+ * fingerprint TA checks the token's HMAC with the auth-token key it gets
+ * from the keymaster app at start (libgf_ud_hal's fetchHmacKeyFromKeyMaster
+ * and sendHmacKey: the key leaves keymaster only encapsulated for the TA),
+ * so only keymaster's Gatekeeper can sign one. QTI's Gatekeeper is
+ * GatekeeperHalDevice in android.hardware.gatekeeper@1.0-impl-qti.so, on
+ * libkeymasterdeviceutils' KeymasterUtils; its enroll() and verify() take
+ * plain pointers, so the bridge calls them itself (no HIDL, no C++ objects
+ * of the platform crossing). HIDL_FETCH_IGatekeeper builds the 0x18-byte
+ * object inline, the same way it is built here: the vtable, a
+ * KeymasterUtils(level) and the level; level 1 is the TEE (the keymaster64
+ * app, commands 0x1001 enroll, 0x1002 verify), 2 the secure processor,
+ * which does not run here (stock picks 1 when vendor.gatekeeper.disable_spu
+ * is true).
+ *
+ * Once, the bridge enrolls a random secret of its own (STATE/gk_secret,
+ * root only; the password handle in STATE/gk_handle); for each ENROLL it
+ * verifies that secret with the pre_enroll challenge and gets the 69-byte
+ * token back. The desktop's own unlock stands in for the password the user
+ * would have typed on Android.
+ */
+#define GK_LIB	"/vendor/lib64/hw/android.hardware.gatekeeper@1.0-impl-qti.so"
+#define KMU_LIB	"libkeymasterdeviceutils.so"
+#define GK_SECRET_LEN	32
 
+typedef int (*gk_enroll_fn)(void *self, uint32_t uid, const uint8_t *cur_handle,
+			    uint32_t cur_handle_len, const uint8_t *cur_pw, uint32_t cur_pw_len,
+			    const uint8_t *pw, uint32_t pw_len, uint8_t **handle,
+			    uint32_t *handle_len);
+typedef int (*gk_verify_fn)(void *self, uint32_t uid, uint64_t challenge, const uint8_t *handle,
+			    uint32_t handle_len, const uint8_t *pw, uint32_t pw_len,
+			    uint8_t **token, uint32_t *token_len, bool *reenroll);
+
+static void *gk_dev;
+static gk_enroll_fn gk_enroll;
+static gk_verify_fn gk_verify;
+
+static bool gk_open(void)
+{
+	void *gk, *kmu, *vtable, *utils;
+	void (*kmu_ctor)(void *, int);
+
+	if (gk_dev)
+		return true;
+	kmu = dlopen(KMU_LIB, RTLD_NOW);
+	gk = dlopen(GK_LIB, RTLD_NOW);
+	if (!kmu || !gk) {
+		say("gatekeeper: dlopen: %s", dlerror());
+		return false;
+	}
+	kmu_ctor = (void (*)(void *, int))dlsym(kmu,
+		"_ZN14keymasterutils14KeymasterUtilsC1E26keymaster_security_level_t");
+	vtable = dlsym(gk, "_ZTV19GatekeeperHalDevice");
+	gk_enroll = (gk_enroll_fn)dlsym(gk, "_ZN19GatekeeperHalDevice6enrollEjPKhjS1_jS1_jPPhPj");
+	gk_verify = (gk_verify_fn)dlsym(gk, "_ZN19GatekeeperHalDevice6verifyEjmPKhjS1_jPPhPjPb");
+	if (!kmu_ctor || !vtable || !gk_enroll || !gk_verify) {
+		say("gatekeeper: symbols missing in %s or %s", GK_LIB, KMU_LIB);
+		return false;
+	}
+	utils = calloc(1, 0x10);
+	gk_dev = calloc(1, 0x18);
+	if (!utils || !gk_dev)
+		return false;
+	kmu_ctor(utils, 1);		/* KM_SECURITY_LEVEL_TRUSTED_ENVIRONMENT */
+	*(void **)gk_dev = (uint8_t *)vtable + 0x10;
+	*(void **)((uint8_t *)gk_dev + 0x8) = utils;
+	*(uint32_t *)((uint8_t *)gk_dev + 0x10) = 1;
+	return true;
+}
+
+static int read_state(const char *name, uint8_t *buf, size_t size)
+{
+	char path[512];
+	int fd, n;
+
+	snprintf(path, sizeof(path), "%s/%s", state_dir, name);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	n = (int)read(fd, buf, size);
+	close(fd);
+	return n;
+}
+
+static bool write_state(const char *name, const uint8_t *buf, size_t size)
+{
+	char path[512], tmp[520];
+	int fd;
+	bool ok;
+
+	snprintf(path, sizeof(path), "%s/%s", state_dir, name);
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return false;
+	ok = write(fd, buf, size) == (ssize_t)size;
+	ok = !fsync(fd) && ok;
+	ok = !close(fd) && ok;
+	if (ok && !rename(tmp, path))
+		return true;
+	unlink(tmp);
+	return false;
+}
+
+static uint8_t gk_secret[GK_SECRET_LEN];
+static uint8_t gk_handle[512];
+static int gk_handle_len = -1;
+
+static bool gk_ready(void)
+{
+	uint8_t *handle = NULL;
+	uint32_t len = 0;
+	int ret, fd;
+
+	if (!gk_open())
+		return false;
+	if (gk_handle_len > 0)
+		return true;
+	if (read_state("gk_secret", gk_secret, sizeof(gk_secret)) == GK_SECRET_LEN) {
+		gk_handle_len = read_state("gk_handle", gk_handle, sizeof(gk_handle));
+		if (gk_handle_len > 0)
+			return true;
+	}
+	/* first use: a random secret, enrolled once */
+	fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || read(fd, gk_secret, sizeof(gk_secret)) != (ssize_t)sizeof(gk_secret)) {
+		if (fd >= 0)
+			close(fd);
+		say("gatekeeper: no random secret");
+		return false;
+	}
+	close(fd);
+	ret = gk_enroll(gk_dev, 0, NULL, 0, NULL, 0, gk_secret, sizeof(gk_secret), &handle, &len);
+	if (ret || !handle || !len || len > sizeof(gk_handle)) {
+		say("gatekeeper: enroll: %d (handle %u bytes)", ret, len);
+		free(handle);
+		return false;
+	}
+	memcpy(gk_handle, handle, len);
+	free(handle);
+	if (!write_state("gk_secret", gk_secret, sizeof(gk_secret)) ||
+	    !write_state("gk_handle", gk_handle, len)) {
+		say("gatekeeper: cannot save the secret in %s", state_dir);
+		return false;
+	}
+	gk_handle_len = (int)len;
+	say("gatekeeper: bridge secret enrolled (handle %u bytes)", len);
+	return true;
+}
+
+static bool gk_token(uint64_t challenge, uint8_t *hat)
+{
+	uint8_t *token = NULL;
+	uint32_t len = 0;
+	bool reenroll = false;
+	int ret;
+
+	if (!gk_ready())
+		return false;
+	ret = gk_verify(gk_dev, 0, challenge, gk_handle, (uint32_t)gk_handle_len, gk_secret,
+			sizeof(gk_secret), &token, &len, &reenroll);
+	if (ret || !token || len != HAT_SIZE) {
+		say("gatekeeper: verify: %d (token %u bytes)", ret, len);
+		free(token);
+		return false;
+	}
+	memcpy(hat, token, HAT_SIZE);
+	free(token);
+	if (reenroll)
+		say("gatekeeper: asks for a re-enroll of the bridge secret");
+	return true;
+}
+
+static bool make_hat(uint64_t challenge, uint8_t *p)
+{
 	memset(p, 0, HAT_SIZE);
 	switch (hat_mode) {
+	case HAT_GATEKEEPER:
+		return gk_token(challenge, p);
 	case HAT_ZERO:
 		p[0] = 0;				/* version */
 		put_le64(p + 1, challenge);		/* challenge, host order */
@@ -345,13 +603,8 @@ static bool make_hat(uint64_t challenge, hidl_array<uint8_t, HAT_SIZE> &hat)
 		put_le64(p + 17, 0);			/* authenticator_id */
 		put_be(p + 25, HW_AUTH_PASSWORD, 4);	/* authenticator_type */
 		put_be(p + 29, (uint64_t)now_ms(), 8);	/* timestamp */
-		/* p + 37: hmac[32], zero: unsigned. VERIFY the TA accepts it. */
+		/* p + 37: hmac[32], zero: unsigned */
 		return true;
-	case HAT_GATEKEEPER:
-		/* TODO: android.hardware.gatekeeper@1.0 enroll()/verify() of a
-		 * bridge secret, as the Pixel bridge's gk_token(). */
-		say("--hat-mode gatekeeper is not implemented yet");
-		return false;
 	}
 	return false;
 }
@@ -472,10 +725,16 @@ static int32_t scale(int32_t v, int32_t max, int32_t panel)
 	return max > 0 ? (int32_t)((int64_t)v * panel / (max + 1)) : v;
 }
 
+static void publish(void);
+
 static void pointer(bool down)
 {
 	if (down) {
 		reply("FINGER DOWN");
+		/* the shell draws the white disc from this (illuminate) before
+		 * the settle below ends and the HAL is told the frame is lit */
+		finger = true;
+		publish();
 		if (hbm_first) {
 			hbm(true);
 			if (hbm_lit)
@@ -624,8 +883,8 @@ static bool capturing(void)
 /* The desktop's view, as the Pixel bridge writes it. */
 static void publish(void)
 {
-	static char last[300];
-	char line[300], tmp[300];
+	static char last[400];
+	char line[400], tmp[400];
 	const char *what = !capturing() ? "idle" : op == OP_ENROLL ? "enroll" : "auth";
 	int fd, n;
 	bool ok;
@@ -635,11 +894,11 @@ static void publish(void)
 	n = snprintf(line, sizeof(line),
 		     "{\"op\":\"%s\",\"finger\":%s,\"x\":%d,\"y\":%d,\"r\":%d,"
 		     "\"w\":%d,\"h\":%d,\"seq\":%u,\"acquired\":%d,\"remaining\":%d,"
-		     "\"error\":%d,\"last\":\"%s\",\"contact\":%s}\n",
+		     "\"error\":%d,\"last\":\"%s\",\"contact\":%s,\"illuminate\":%s}\n",
 		     what, finger && capturing() ? "true" : "false",
 		     sensor_x, sensor_y, sensor_r, panel_w, panel_h,
 		     ui_seq, ui_acquired, ui_remaining, ui_error, ui_last,
-		     sensor_contact ? "true" : "false");
+		     sensor_contact ? "true" : "false", illuminate ? "true" : "false");
 	if (n < 0 || n >= (int)sizeof(line) || !strcmp(line, last))
 		return;
 	snprintf(tmp, sizeof(tmp), "%s.new", ui_state_path);
@@ -664,7 +923,7 @@ static void op_done(void)
 	if (hbm_lit)
 		hbm(false);
 	if (op == OP_ENROLL)
-		request_ok(hal->postEnroll(), "postEnroll");	/* the challenge is single-use */
+		request_ok(hal->post_enroll(hal), "postEnroll");	/* the challenge is single-use */
 	op = OP_NONE;
 	op_ending = false;
 	ending_reply = false;
@@ -677,21 +936,21 @@ static void end_capture(bool report)
 	ending_reply = ending_reply || report;
 	if (op_ending)
 		return;
-	request_ok(hal->cancel(), "cancel");
+	request_ok(hal->cancel(hal), "cancel");
 	op_ending = true;
 	op_ending_since = now_ms();
 }
 
 static void start_enroll(void)
 {
-	hidl_array<uint8_t, HAT_SIZE> hat;
-	uint64_t challenge = checked<uint64_t>(hal->preEnroll(), "preEnroll");
+	uint8_t hat[HAT_SIZE];
+	uint64_t challenge = hal->pre_enroll(hal);
 
 	if (!challenge)
 		say("preEnroll gave challenge 0");
 	if (!make_hat(challenge, hat) ||
-	    !request_ok(hal->enroll(hat, 0, enroll_timeout_s), "enroll")) {
-		request_ok(hal->postEnroll(), "postEnroll");
+	    !request_ok(hal->enroll(hal, hat, 0, enroll_timeout_s), "enroll")) {
+		request_ok(hal->post_enroll(hal), "postEnroll");
 		reply("ERROR %d", ERR_UNABLE_TO_PROCESS);
 		return;
 	}
@@ -702,7 +961,7 @@ static void start_enroll(void)
 static void start_auth(void)
 {
 	/* operationId 0: an unlock, no crypto operation */
-	if (!request_ok(hal->authenticate(0, 0), "authenticate")) {
+	if (!request_ok(hal->authenticate(hal, 0, 0), "authenticate")) {
 		reply("ERROR %d", ERR_UNABLE_TO_PROCESS);
 		return;
 	}
@@ -738,23 +997,25 @@ static void command(const char *line)
 	} else if (!strcmp(line, "LIST")) {
 		list_len = 0;
 		list[0] = '\0';
-		if (request_ok(hal->enumerate(), "enumerate")) {
+		if (request_ok(hal->enumerate(hal), "enumerate")) {
 			op = OP_LIST;
 			op_since = now_ms();
 		}
 		else
 			reply("ERROR %d", ERR_UNABLE_TO_PROCESS);
-	} else if (sscanf(line, "DELETE %d", &id) == 1 && id > 0) {
+	} else if (sscanf(line, "DELETE %d", &id) == 1 && id != 0) {
+		/* OnePlus's HAL hands out 32-bit ids; the protocol carries them as
+		 * int32 (libfprint's driver atoi()s them), so they can be negative */
 		/* remove(gid, 0) would remove every finger: never from here */
 		delete_id = id;
-		if (request_ok(hal->remove(0, (uint32_t)id), "remove")) {
+		if (request_ok(hal->remove(hal, 0, (uint32_t)id), "remove")) {
 			op = OP_DELETE;
 			op_since = now_ms();
 		}
 		else
 			reply("ERROR %d", ERR_UNABLE_TO_PROCESS);
 	} else if (!strcmp(line, "RESETLOCKOUT")) {
-		say("RESETLOCKOUT: HIDL 2.1 has no resetLockout; the lockout ends on its own");
+		say("RESETLOCKOUT: HAL 2.1 has no resetLockout; the lockout ends on its own");
 		reply("ERROR %d", ERR_UNABLE_TO_PROCESS);
 	} else if (!strcmp(line, "STATUS")) {
 		reply("READY %d %d %d", sensor_x, sensor_y, sensor_r);
@@ -803,6 +1064,15 @@ static void hal_event(const struct event &e)
 		say("HAL error %d (vendor %d)", e.a, e.b);
 		if (op == OP_NONE)
 			return;
+		/* Vendor error 6 is one bad capture (preprocessing failed, a
+		 * dirty or partial image): the HAL keeps the operation going, and
+		 * the in-screen fingerprint code on Android ignores it
+		 * (LineageOS's OnePlus FingerprintInscreen::handleError). Pass it
+		 * on as a "try again" hint, not as the operation's end. */
+		if (e.a == ERR_VENDOR && e.b == 6 && (op == OP_ENROLL || op == OP_AUTH) && !op_ending) {
+			reply("ACQUIRED 2 0");	/* AIDL INSUFFICIENT */
+			return;
+		}
 		if (e.a < 0) {	/* ERROR_LOCKOUT */
 			if (op == OP_AUTH || op == OP_ENROLL) {
 				if (!op_ending)
@@ -917,13 +1187,6 @@ static int open_listener(void)
 	return fd;
 }
 
-static void *binder_looper(void *)
-{
-	android::hardware::joinRpcThreadpool();
-	say("the binder thread ended");
-	_exit(3);
-}
-
 /* SIGTERM/SIGINT: the main loop turns HBM off and exits. */
 static volatile sig_atomic_t quit;
 static void on_signal(int sig)
@@ -935,9 +1198,9 @@ static void on_signal(int sig)
 static void usage(void)
 {
 	say("usage: omamobile-fp-hotdog-bridge [--socket PATH] [--state DIR] [--touch EVDEV]\n"
-	    "         [--hbm PATH] [--notify PATH] [--hbm-settle-ms MS] [--hbm-first 0|1]\n"
+	    "         [--hbm PATH] [--notify PATH] [--hbm-settle-ms MS] [--hbm-first 0|1] [--illuminate 0|1]\n"
 	    "         [--ui-state PATH] [--inhibit DIR] [--panel WxH] [--sensor X,Y,R]\n"
-	    "         [--hat-mode zero|gatekeeper] [--enroll-timeout S]");
+	    "         [--hat-mode gatekeeper|zero] [--enroll-timeout S] [--module SO]");
 	exit(2);
 }
 
@@ -962,10 +1225,14 @@ int main(int argc, char **argv)
 			hbm_settle_ms = atoi(v);
 		else if (!strcmp(argv[i], "--hbm-first"))
 			hbm_first = atoi(v) != 0;
+		else if (!strcmp(argv[i], "--illuminate"))
+			illuminate = atoi(v) != 0;
 		else if (!strcmp(argv[i], "--ui-state"))
 			ui_state_path = v;
 		else if (!strcmp(argv[i], "--inhibit"))
 			inhibit_dir = v;
+		else if (!strcmp(argv[i], "--module"))
+			module_path = v;
 		else if (!strcmp(argv[i], "--enroll-timeout"))
 			enroll_timeout_s = (uint32_t)atoi(v);
 		else if (!strcmp(argv[i], "--hat-mode")) {
@@ -1002,27 +1269,15 @@ int main(int argc, char **argv)
 		say("pipe: %s", strerror(errno));
 		return 1;
 	}
-	/* one hwbinder thread for the callbacks: ours, joined explicitly */
-	android::hardware::configureRpcThreadpool(1, true /* callerWillJoin */);
-	pthread_t looper;
-	if (pthread_create(&looper, NULL, binder_looper, NULL)) {
-		say("no binder thread");
+	if (!open_hal())
+		return 1;
+	if (!request_ok(hal->set_notify(hal, on_notify), "setNotify"))
+		return 1;
+	if (access(state_dir, W_OK)) {
+		say("%s: not writable", state_dir);
 		return 1;
 	}
-
-	hal = IBiometricsFingerprint::getService();
-	if (!hal) {
-		say("no %s/default", IBiometricsFingerprint::descriptor);
-		return 1;
-	}
-	death = new Death();
-	callback = new Callback();
-	checked<bool>(hal->linkToDeath(death, 0), "linkToDeath");
-	if (!checked<uint64_t>(hal->setNotify(callback), "setNotify")) {
-		say("setNotify: the HAL has no device");
-		return 1;
-	}
-	if (!request_ok(hal->setActiveGroup(0, hidl_string(state_dir)), "setActiveGroup"))
+	if (!request_ok(hal->set_active_group(hal, 0, state_dir), "setActiveGroup"))
 		return 1;
 	say("HAL ready; sensor (%d, %d) r %d (placeholders unless --sensor)", sensor_x,
 	    sensor_y, sensor_r);
@@ -1089,9 +1344,8 @@ int main(int argc, char **argv)
 		publish();
 	}
 	say("stopping");
-	/* a failed Return must be looked at, or its destructor aborts */
 	if (op == OP_ENROLL || op == OP_AUTH)
-		(void)hal->cancel().isOk();
+		(void)hal->cancel(hal);
 	if (finger)
 		notify("touchup");
 	hbm(false);

@@ -313,4 +313,126 @@ comes only after F10 passes.
 
 ## 7. Results
 
-None yet: nothing has run on the phone.
+Nothing has run on the phone yet.
+
+**2026-11-04, owner's decision on RPMB (F7):** yes. Asked with the facts:
+QSEE's Gatekeeper (in `keymaster64`, which the fingerprint TA trusts for
+its enrollment tokens) keeps its records in an SFS file with anti-replay
+data in RPMB, and without the RPMB listener every Gatekeeper enroll fails
+(status -30, for any uid) before any listener request. RPMB writes are
+permanent (an MSM restore does not undo them); calibration, IMEI and the
+radio partitions are not in RPMB. The owner answered "Yes, enable RPMB".
+Scope: `allow_rpmb=Y`, `/etc/omamobile/fp-hotdog-allow-rpmb`, and only the
+UFS RPMB well-known LU for qseecomd; every partition stays read-only.
+
+**2026-11-04, F2-F8 and fprintd: fingerprint unlock works**
+(`7.3.0-rc6-omamobile-push1-g5f2e6c289701`, the compat driver as kernel
+`6349bfc48`, built as an external module; the overlays applied at runtime).
+The owner enrolled the right index finger through the shell's enrollment
+screen (fprintd) and unlocked the lock screen with it. What it took, in
+the order it was found:
+
+- F2: gpio90/101/118/131 unclaimed, inputs pulled down. Pass.
+- F3: `fp-sensor` applied at runtime; goodix-fp: `irq 187, supply
+  switched, netlink 25`; opening `/dev/goodix_fp` raised gpio101 and
+  released gpio131, the sensor's IRQ fired once. Pass.
+- F4: `/dev/qseecom`, QSEE `0x1400000`, 20 MiB at `0x9e400000`, lists
+  empty, `allow_rpmb` N. Pass.
+- Driver ABI (kernel commit above): register/unregister/send were 2/3/1,
+  the library uses 1/2/3; LOAD_APP's img_len includes the .mdt;
+  GET_QSEOS_VERSION must answer 0x14 (or the library's
+  QSEECom_receive_req never copies a listener's request); QSEE wants
+  page-sized listener buffers.
+- qseecomd: needs the runtime APEX (libandroidicu) and the VNDK paths, a
+  private ssd file (it starts no listener without one), and to stay root
+  (the shim ignores setuid/setgid/capset; the nodes are root 0600).
+  Listeners it registers: 0xa FS, 0xb time, 0x7000 GP FS, 0x1100 request
+  cancel, 0x9000 QISL, 0x3000 SSD (allowed), 0x2000 RPMB (allowed after
+  the owner's decision), 0x4000 secure UI, 0xb000 SPL, 0xc000 output
+  protection (refused).
+- F5: `loaded TA gfp9558`; keymaster64 is found loaded (app id 1) and is
+  never unloaded by the driver (not ours).
+- The HAL: OnePlus's HIDL service only wraps the legacy module, so the
+  bridge loads `hw/goodix.fod.msmnile.so` itself (fingerprint_device_t,
+  no HIDL; built with the NDK). It needs servicemanager,
+  vndservicemanager and hwservicemanager, heap 14 (4 MiB secure carve-out,
+  CP_CDSP) besides qsecom 27/19, the factory calibration (persist's
+  `data/{cali_data,caliParamsInfo,BMatrix,chartbase}.so`, copied from the
+  verified backup into the private persist; the real one is untouched)
+  or it reports `spmt is not pass`. CDSP isn't there
+  (`GF_ERROR_DSP_NOT_AVAILABLE`); the HAL falls back to "normal
+  authentication".
+- Enrollment tokens: the TA checks them (`GF_ERROR_UNTRUSTED_ENROLL` for an
+  unsigned one); keymaster's auth-token key reaches the TA only
+  encapsulated (152 bytes). The bridge signs them with QTI's Gatekeeper
+  (GatekeeperHalDevice, level 1, keymaster64), which keeps its records in
+  RPMB: without the RPMB listener every enroll was -30.
+- RPMB: librpmb reaches UFS RPMB as an sg node; the host loads no sg
+  driver (it would expose every LU past the guard). The runner binds only
+  the RPMB well-known LU's bsg node in, and the shim translates SG_IO
+  v3 to bsg v4, GET_IDLUN and the three UFS descriptor fields librpmb
+  reads (from sysfs). Gatekeeper enroll and verify then worked (a 58-byte
+  handle, a 69-byte token).
+- The sensor's SPI: QSEE drives QUP0 SE3 (gpio144-147), and nothing in
+  Linux had its clocks on (an empty image: `GF_ERROR_PREPROCESS_FAILED`).
+  `fp-spi3` enables the SE node for its pins (spi-geni defers: the SE is
+  in GSI mode, no GPI DMA), and a bring-up module holds SE3's and the QUP0
+  wrapper's clocks on. TODO: goodix-fp's GF_IOC_ENABLE_SPI_CLK.
+- Light: an optical sensor needs the pixels under the finger lit. The
+  panel has no LHBM: the shell draws a white disc over the sensor while a
+  finger is down (`"illuminate": true` in the bridge's state), the bridge
+  turns HBM on and waits 300 ms before `ui_ready`. The sensor's centre is
+  720,2728 r 110 (LineageOS hotdog lineage-18.1: top-left 610,2618, size
+  220). Dimming the rest of the screen (stock's notify_dim) made it worse
+  (7 of 43 captures), and so did the real battery temperature for the
+  algorithm (5 of ~40); disc alone at the default 0 C: 15 of 19 and 20 of
+  20. Both are switches (OMAMOBILE_FP_DIM, OMAMOBILE_FP_BATTERY_TEMP).
+- Vendor error 6 (one bad capture) no longer ends the operation, as
+  LineageOS's FingerprintInscreen::handleError ignores it.
+- Match: 2 of 4 attempts matched in a direct test (`Auth success`), the
+  others `NOT_LIVE_FINGER`; the lock screen unlocked with the finger.
+
+Open: the bring-up pieces (runtime overlays, the clock module, the module
+built outside the tree, the test unit) go into the kernel and the device
+package; liveness misses half the attempts (CDSP?); the bridge's id is
+the HAL's 32-bit id as int32.
+
+**2026-11-04, F1 (laptop only), part 1: the vendor files.** Source: the
+owner's MSM package of OxygenOS 10.0.14 (`hotdog_14_O.22_210127`, build
+`2101212101`), the one the phone was restored with on 2026-11-01, so its
+TrustZone and modem images are the phone's. The `.ops` (md5 as in its
+`md5sum_pack.md5`) decrypted with bkerler's `opscrypto.py` (MBox5);
+`super.img` is sparse, LP 10.0 with `system_a`, `product_a`, `vendor_a`,
+`odm_a`; `vendor_a` and `odm_a` are ext4. Everything is under
+`~/android/reference/hotdog/ops/` and `vendor-fp/` (never in the repo).
+
+- HAL: `vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service`
+  (init service `vendor.fps_hal`, user `system`, `class late_start`, starts
+  `vendor.qseecomd`), which loads `hw/goodix.fod.msmnile.so` (needs
+  `fp_hal_extension.so` and `vendor.oneplus.fingerprint.extension@1.0.so`),
+  which uses `libgf_ud_hal.so` (`libQSEEComAPI.so`, `libion.so`,
+  `vendor.goodix.hardware.biometrics.fingerprint@2.1.so`). The service
+  checks `persist.vendor.oem.fp.version` against the module's version.
+  `qseecomd` and `libQSEEComAPI.so` are in `vendor/`.
+- **The TA is `gfp9558`** (U1). `goodix::initCustomizedParams` writes the
+  name byte by byte (no plain string), and `CaEntry::startTap` tries
+  `QSEECom_start_app(…, path, "gfp9558", 0x1000)` for each of
+  `TA_PATH_LIST`: `/vendor/firmware_mnt/image`, `/system/etc/firmware`,
+  `/firmware/image`, `/vendor/firmware`. Its files (`gfp9558.mdt`, `.b00`-`.b07`,
+  6.5 MB) are in `NON-HLOS.bin`'s `image/`, beside `gfp9508`, `gfp9608`
+  (other sensor models) and `fingerpr`. The runner's `TA_DIRS` and its
+  `/firmware` bind already cover these paths.
+- **The HAL starts a second app, `keymaster64`,** from `/firmware/image`
+  (the same function, a second `QSEECom_start_app`). There is no
+  `keymaster64.mdt` in `image/`: the keymaster app comes from the `km4`
+  partition (`km4.mbn` in the package), which the boot chain loads, so the
+  HAL most likely finds it already loaded. So `keymaster64` has to be on
+  the compat driver's `app_allowlist` too (an owner's decision: it is the
+  keymaster, not the fingerprint TA), and what the HAL sends it is open:
+  probably the auth-token key (U7). Next in F1.
+- U2: the TA drives the sensor through QSEE's secure SPI
+  (`gf_bus_dc_secspi_*`); which QUP that is isn't in the TA. Still open.
+- Still open for F1 step 3: the qseecom ioctls `libQSEEComAPI.so` issues
+  (U3), the ion heap mask (`carveoutIonInit` in `libgf_ud_hal.so`), the
+  netlink events (U6), the auth-token check (U7), and the system libraries
+  the chroot needs from `system_a`.
