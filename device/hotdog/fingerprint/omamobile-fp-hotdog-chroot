@@ -1,0 +1,460 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# omamobile-fp-hotdog-chroot: run OnePlus's Goodix fingerprint stack for the
+# OnePlus 7T Pro (hotdog) in a minimal chroot (device/hotdog/
+# FINGERPRINT-PLAN.md). THEORETICAL: staged in device/hotdog/fingerprint,
+# packaged nowhere, never run on a phone.
+#
+#   omamobile-fp-hotdog-chroot check          preconditions only; changes nothing
+#   omamobile-fp-hotdog-chroot paths          the paths in use; read-only
+#   omamobile-fp-hotdog-chroot start [STAGE]  start the stack up to STAGE, in
+#                                             the foreground (systemd runs it),
+#                                             and supervise it until stopped
+#   omamobile-fp-hotdog-chroot ns CMD...      a host command in the stack's
+#                                             namespaces
+#   omamobile-fp-hotdog-chroot run CMD...     an Android binary in the chroot
+#
+# STAGE (each includes the ones before):
+#   listeners  hwservicemanager, qseecomd (QSEE's listener services)
+#   hal        + OnePlus's Goodix fingerprint HAL (it loads its TA in QSEE)
+#   bridge     + omamobile-fp-hotdog-bridge, fprintd's way in (default)
+# OMAMOBILE_FP_KEYS=1 also starts the QSEE keymaster and gatekeeper HALs
+# before the HAL. Off by default: their first run provisions keys in the
+# secure world, the human's call (FINGERPRINT-PLAN).
+#
+# The Android files are the owner's own, from their OxygenOS image
+# (README.md, never shipped by Omarchy Mobile), in $IMAGE; our shims in
+# $SHIM and $ION_SHIM. The chroot is a private mount namespace on a tmpfs:
+# the image is bind-mounted read-only and only $STATE persists. It shares
+# the host's network namespace on purpose: goodix-fp's netlink socket exists
+# only in the initial one.
+#
+# Safety:
+#   - the secure world only through our kernel's qcom_qseecom_compat, which
+#     loads only the trusted apps the human listed in its app_allowlist
+#     parameter: the runner refuses while that list is empty, and prints it;
+#   - RPMB: qcom_qseecom_compat refuses the RPMB listener unless its
+#     allow_rpmb parameter is Y. With it Y, the runner refuses too, unless
+#     /etc/omamobile/fp-hotdog-allow-rpmb exists (the human's explicit
+#     decision). And no block device, no SCSI generic node enters the
+#     chroot, so qseecomd's RPMB service has nothing to write to anyway;
+#   - Android partitions: Linux never writes them. The TA's file-system
+#     listener (qseecomd) writes what stock kept in /persist and /data
+#     (templates, the TA's own state); here it gets private directories on
+#     userdata, $STATE/persist and $STATE/data. The real persist partition
+#     is never mounted, bound or copied in (stock's own fingerprint files
+#     there stay as they are, for slot A);
+#   - once per boot: QSEE keeps a loaded app and its registered listeners
+#     until a reboot, and a second qseecomd registering the same listeners
+#     in the same boot is untested ground. A marker in /run refuses a
+#     second start until a reboot (the unit has no Restart=).
+#
+# Overrides of the state and run paths (OMAMOBILE_FP_STATE, _RUN, _UIDIR)
+# are honoured only with OMAMOBILE_FP_TEST=1, which the unit never sets.
+set -euo pipefail
+
+IMAGE=${OMAMOBILE_FP_IMAGE:-/usr/lib/omamobile-fp-hotdog/root}
+SHIM=${OMAMOBILE_FP_SHIM:-/usr/lib/omamobile-fp-hotdog/omamobile-fp-shim.so}
+ION_SHIM=${OMAMOBILE_FP_ION_SHIM:-/usr/lib/omamobile-fp-hotdog/omamobile-fp-ion-shim.so}
+BRIDGE=${OMAMOBILE_FP_BRIDGE:-/usr/lib/omamobile-fp-hotdog/omamobile-fp-hotdog-bridge}
+PROPS=${OMAMOBILE_FP_PROPS_EXTRA:-/usr/lib/omamobile-fp-hotdog/props-hotdog.conf}
+
+# The vendor's programs. UNVERIFIED names: confirm each against the owner's
+# vendor image (README.md, "Names to confirm") and override here or in
+# $STATE/paths.conf (KEY=VALUE lines).
+QSEECOMD=/vendor/bin/qseecomd
+FP_HAL=/vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service
+KEYMASTER=/vendor/bin/hw/android.hardware.keymaster@4.0-service-qti
+GATEKEEPER=/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti
+# Where libQSEEComAPI looks for trusted apps (.mdt/.bNN): stock mounts the
+# modem partition's image directory at /vendor/firmware_mnt and keeps more
+# in /vendor/firmware. Both come from $IMAGE, read-only.
+# (informational: setup() binds all of vendor/, and vendor/firmware_mnt at
+# /firmware too)
+TA_DIRS="/vendor/firmware_mnt/image /vendor/firmware"
+# The bridge's options; the sensor circle is a placeholder until the
+# plan's calibration step (x,y,r in panel pixels).
+SENSOR=${OMAMOBILE_FP_SENSOR:-720,2700,110}
+PANEL=1440x3120
+HBM_FIRST=${OMAMOBILE_FP_HBM_FIRST:-0}
+HAT_MODE=${OMAMOBILE_FP_HAT_MODE:-zero}
+
+STATE=/var/lib/omamobile-fp-hotdog
+RUN=/run/omamobile-fp-hotdog
+# fprintd's drop-in (FP_OMAMOBILE_UDFPS=/run/omamobile-fp/sock/bridge.sock)
+# and the shell's fingerprint target (/run/omamobile-fp-ui) are the Pixel
+# stack's paths; the hotdog keeps them, so neither changes.
+SOCKDIR=/run/omamobile-fp/sock
+UIDIR=/run/omamobile-fp-ui
+if [[ ${OMAMOBILE_FP_TEST:-} == 1 ]]; then
+  STATE=${OMAMOBILE_FP_STATE:-$STATE}
+  RUN=${OMAMOBILE_FP_RUN:-$RUN}
+  UIDIR=${OMAMOBILE_FP_UIDIR:-$UIDIR}
+fi
+INHIBITDIR=$UIDIR/inhibit
+MARKER=$RUN/started
+ROOT=$RUN/root
+NSPID=$RUN/ns.pid
+CONSENT_RPMB=/etc/omamobile/fp-hotdog-allow-rpmb
+MODPARAMS=/sys/module/qcom_qseecom_compat/parameters
+# Our touchscreen driver's input device name (mainline s6sy761)
+TOUCH_NAME=s6sy761
+
+say() { printf 'omamobile-fp-hotdog: %s\n' "$*" >&2; }
+die() { say "error: $*"; exit 1; }
+
+# $STATE/paths.conf: the confirmed vendor names, if the image differs
+if [[ -f $STATE/paths.conf ]]; then
+  while IFS='=' read -r k v; do
+    case $k in
+      QSEECOMD|FP_HAL|KEYMASTER|GATEKEEPER|TA_DIRS|SENSOR|HBM_FIRST|HAT_MODE) printf -v "$k" '%s' "$v" ;;
+    esac
+  done < <(grep -E '^[A-Z_]+=' "$STATE/paths.conf")
+fi
+
+CHROOT_BIN=$(PATH=/usr/bin:/bin:/usr/sbin:/sbin command -v chroot || true)
+
+alive() {
+  local st
+  st=$(sed 's/^.*) //' "$ROOT/proc/$1/stat" 2>/dev/null) || return 1
+  [[ -n $st && ${st%% *} != Z ]]
+}
+
+stop_children() {
+  local tenths=$1 n p i any; shift
+  for n in "$@"; do
+    p=${PIDS[$n]:-}
+    [[ -n $p ]] && kill -TERM "$p" 2>/dev/null || true
+  done
+  for ((i = 0; i < tenths; i++)); do
+    any=0
+    for n in "$@"; do
+      p=${PIDS[$n]:-}
+      [[ -n $p ]] && alive "$p" && any=1
+    done
+    ((any)) || return 0
+    sleep 0.1
+  done
+  say "still running after $((tenths / 10)) s: $*"
+}
+
+# The bridge first (it turns the panel's HBM off), then the HALs, and
+# qseecomd last, so no TA request is waiting on a listener that is gone.
+STOPPING=
+stop() {
+  local code=${1:-0}
+  [[ -n $STOPPING ]] && exit "$code"
+  STOPPING=1
+  trap '' TERM INT
+  say "stopping: the bridge, the HALs, then qseecomd"
+  rm -f "$UIDIR/state.json" "$UIDIR/state.json.new"
+  stop_children 50 bridge
+  # HBM off even if the bridge could not do it (a write of 0 is harmless)
+  [[ -n ${HBM_ATTR:-} ]] && echo 0 > "$HBM_ATTR" 2>/dev/null || true
+  stop_children 100 fingerprint
+  stop_children 50 gatekeeper keymaster
+  stop_children 50 qseecomd
+  stop_children 30 hwservicemanager
+  kill -TERM 0 2>/dev/null || true
+  exit "$code"
+}
+
+touch_event() {
+  local d
+  for d in /sys/class/input/event*; do
+    [[ $(cat "$d/device/name" 2>/dev/null) == "$TOUCH_NAME" ]] && { basename "$d"; return; }
+  done
+}
+
+# The panel driver's hbm attribute (the backlight device of the DSI panel)
+hbm_attr() {
+  local f
+  for f in /sys/class/backlight/*/hbm; do
+    [[ -f $f ]] && { echo "$f"; return; }
+  done
+}
+
+# goodix-fp's notify attribute (the platform device of the sensor)
+notify_attr() {
+  local f
+  for f in /sys/bus/platform/drivers/goodix-fp/*/notify; do
+    [[ -f $f ]] && { echo "$f"; return; }
+  done
+}
+
+param() { cat "$MODPARAMS/$1" 2>/dev/null || true; }
+
+check() {
+  local ok=1 apps rpmb
+  [[ $EUID -eq 0 ]] || die "run as root"
+  [[ -x $CHROOT_BIN ]] || { say "no chroot(1) on the host (coreutils)"; ok=0; }
+  tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | grep -cx 'oneplus,hotdog' >/dev/null ||
+    { say "not a OnePlus 7T Pro (oneplus,hotdog)"; ok=0; }
+  [[ -f $IMAGE$FP_HAL ]] || { say "no $FP_HAL in $IMAGE (the owner's vendor image; README.md)"; ok=0; }
+  [[ -f $IMAGE$QSEECOMD ]] || { say "no $QSEECOMD in $IMAGE"; ok=0; }
+  [[ -f $SHIM ]] || { say "no shim at $SHIM (fingerprint/Makefile)"; ok=0; }
+  [[ -f $ION_SHIM ]] || { say "no ion shim at $ION_SHIM (device/hotdog/fingerprint/Makefile)"; ok=0; }
+  [[ -c /dev/qseecom ]] || { say "no /dev/qseecom (qcom_qseecom_compat loaded?)"; ok=0; }
+  [[ -c /dev/goodix_fp ]] || { say "no /dev/goodix_fp (goodix-fp bound to the sensor node?)"; ok=0; }
+  apps=$(param app_allowlist)
+  if [[ -z $apps || $apps == "(null)" ]]; then
+    say "qcom_qseecom_compat's app_allowlist is empty: no trusted app may load. The human sets it (FINGERPRINT-PLAN)"
+    ok=0
+  else
+    say "trusted apps allowed to load: $apps"
+  fi
+  rpmb=$(param allow_rpmb)
+  if [[ $rpmb == Y ]]; then
+    if [[ -e $CONSENT_RPMB ]]; then
+      say "allow_rpmb=Y and $CONSENT_RPMB exists: the RPMB listener may register"
+    else
+      say "allow_rpmb=Y without $CONSENT_RPMB: refusing (RPMB writes are the human's decision)"
+      ok=0
+    fi
+  fi
+  [[ -x $BRIDGE ]] || say "no bridge at $BRIDGE: only stages before 'bridge' can run"
+  [[ -n $(touch_event) ]] || say "no touchscreen ($TOUCH_NAME): the bridge cannot start captures"
+  [[ -n $(hbm_attr) ]] || say "no panel hbm attribute: captures will see an unlit finger"
+  [[ -n $(notify_attr) ]] || say "no goodix-fp notify attribute: the HAL never hears of a finger"
+  grep -qw binder /proc/filesystems || { say "kernel has no binderfs"; ok=0; }
+  [[ -n ${OMAMOBILE_FP_IN_NS:-} || ! -e $MARKER ]] ||
+    say "the stack already started this boot: a new start needs a reboot"
+  ((ok)) || exit 1
+  say "preconditions met"
+}
+
+bind() {
+  local src=$1 dst=$2 mode=${3:-rw}
+  if [[ -d $src ]]; then mkdir -p "$dst"; else mkdir -p "$(dirname "$dst")"; : > "$dst"; fi
+  mount --bind "$src" "$dst"
+  [[ $mode == ro ]] && mount -o remount,bind,ro "$dst"
+  return 0
+}
+
+write_props() {
+  local dir=$1 f line k v
+  mkdir -p "$dir"
+  for f in "$ROOT/system/build.prop" "$ROOT/vendor/build.prop" "$PROPS" "$STATE/props.conf"; do
+    [[ -f $f ]] || continue
+    while IFS= read -r line; do
+      [[ $line =~ ^[[:space:]]*# || $line != *=* ]] && continue
+      k=${line%%=*} v=${line#*=}
+      [[ $k =~ ^[A-Za-z0-9_.:@-]+$ ]] || continue
+      printf '%s' "$v" > "$dir/$k"
+    done < "$f"
+  done
+}
+
+# Fake sysfs: CPU and device tree read-only, and our two attributes at fixed
+# paths for the bridge. Nothing of OnePlus's own sysfs exists here; the HAL's
+# writes to it fail (VERIFY what it writes and whether it minds).
+setup_sys() {
+  local sys=$ROOT/sys
+  mount -t tmpfs -o mode=0755,nosuid,nodev,noexec sysfs-skel "$sys"
+  bind /sys/devices/system/cpu "$sys/devices/system/cpu" ro
+  bind /sys/firmware/devicetree "$sys/firmware/devicetree" ro
+  mkdir -p "$sys/omamobile"
+  [[ -n $HBM_ATTR ]] && bind "$HBM_ATTR" "$sys/omamobile/hbm"
+  [[ -n $NOTIFY_ATTR ]] && bind "$NOTIFY_ATTR" "$sys/omamobile/fp_notify"
+  mount -o remount,ro "$sys"
+}
+
+setup_dev() {
+  local dev=$ROOT/dev n ev
+  mount -t tmpfs -o mode=0755,nosuid dev "$dev"
+  for n in null zero full random urandom kmsg; do bind "/dev/$n" "$dev/$n"; done
+  bind /dev/qseecom "$dev/qseecom"
+  bind /dev/goodix_fp "$dev/goodix_fp"
+  # no /dev/ion: the ion shim answers it from /dev/qseecom
+  ev=$(touch_event)
+  [[ -n $ev ]] && bind "/dev/input/$ev" "$dev/input/touchscreen" ro
+  # no /dev/block, no /dev/sg*, no /dev/bsg: nothing in here reaches storage
+  mkdir -p "$dev/socket" "$dev/binderfs"
+  install -d -m 0700 "$SOCKDIR"
+  bind "$SOCKDIR" "$dev/socket/omamobile-fp"
+  install -d -m 0755 "$UIDIR"
+  rm -f "$UIDIR/state.json" "$UIDIR/state.json.new"
+  install -d -m 1777 "$INHIBITDIR"
+  bind "$UIDIR" "$dev/socket/omamobile-fp-ui"
+  mount -t binder binder "$dev/binderfs"
+  for n in binder hwbinder vndbinder; do
+    [[ -e $dev/binderfs/$n ]] || die "binderfs has no $n (CONFIG_ANDROID_BINDER_DEVICES)"
+    ln -s "binderfs/$n" "$dev/$n"
+  done
+  mkdir -p "$dev/__omamobile_props__"
+  mount -t tmpfs -o mode=0755,nosuid,nodev,noexec props "$dev/__omamobile_props__"
+  write_props "$dev/__omamobile_props__"
+}
+
+# The TA's files, which stock kept on persist and data, in private
+# directories on userdata. UNVERIFIED stock paths: qseecomd's file-system
+# listener and the HAL use some of /persist/data, /mnt/vendor/persist/data,
+# /data/vendor/tzstorage and /data/vendor_de/0/fpdata; all are offered.
+setup_data() {
+  mkdir -p "$STATE/persist/data" "$STATE/data/vendor/tzstorage" \
+    "$STATE/data/vendor_de/0/fpdata" "$STATE/data/vendor/fingerprint" \
+    "$STATE/data/vendor/goodix" "$STATE/data/vendor/omamobile-fp"
+  chmod 0700 "$STATE" "$STATE/persist" "$STATE/data"
+  bind "$STATE/data" "$ROOT/data"
+  bind "$STATE/persist" "$ROOT/persist"
+  bind "$STATE/persist" "$ROOT/mnt/vendor/persist"
+}
+
+setup() {
+  mkdir -p "$ROOT"
+  mount -t tmpfs -o mode=0755,nosuid omamobile-fp-hotdog "$ROOT"
+  for d in system vendor; do bind "$IMAGE/$d" "$ROOT/$d" ro; done
+  [[ -d $IMAGE/apex ]] && bind "$IMAGE/apex" "$ROOT/apex" ro
+  mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/data" "$ROOT/tmp" \
+    "$ROOT/persist" "$ROOT/mnt/vendor/persist" "$ROOT/omamobile"
+  # /firmware: some vendors look for apps there; the image's copy, read-only
+  [[ -d $IMAGE/vendor/firmware_mnt ]] && bind "$IMAGE/vendor/firmware_mnt" "$ROOT/firmware" ro
+  ln -s /system/bin "$ROOT/bin"
+  ln -s /system/etc "$ROOT/etc"
+  mount -t tmpfs -o mode=1777,nosuid,nodev tmp "$ROOT/tmp"
+  mount -t proc -o nosuid,nodev,noexec proc "$ROOT/proc"
+  bind "$SHIM" "$ROOT/omamobile/omamobile-fp-shim.so" ro
+  bind "$ION_SHIM" "$ROOT/omamobile/omamobile-fp-ion-shim.so" ro
+  [[ -x $BRIDGE ]] && bind "$BRIDGE" "$ROOT/omamobile/omamobile-fp-hotdog-bridge" ro
+  setup_dev
+  setup_sys
+  setup_data
+}
+
+LIBS_VENDOR=/vendor/lib64:/vendor/lib64/hw:/system/lib64
+LIBS_SYSTEM=/system/lib64:/vendor/lib64
+spawn() {
+  local name=$1 kind=$2; shift 2
+  local libs=$LIBS_VENDOR
+  [[ $kind == system ]] && libs=$LIBS_SYSTEM
+  say "starting $name"
+  env -i PATH=/system/bin:/vendor/bin \
+    LD_LIBRARY_PATH="$libs" \
+    LD_PRELOAD="/omamobile/omamobile-fp-shim.so /omamobile/omamobile-fp-ion-shim.so" \
+    OMAMOBILE_FP_PROPS=/dev/__omamobile_props__ \
+    OMAMOBILE_FP_LOGLEVEL="${OMAMOBILE_FP_LOGLEVEL:-3}" \
+    ${OMAMOBILE_FP_ION_ABI:+OMAMOBILE_FP_ION_ABI="$OMAMOBILE_FP_ION_ABI"} \
+    ${OMAMOBILE_FP_ION_HEAPS:+OMAMOBILE_FP_ION_HEAPS="$OMAMOBILE_FP_ION_HEAPS"} \
+    ANDROID_ROOT=/system ANDROID_DATA=/data \
+    "$CHROOT_BIN" "$ROOT" "$@" > >(sed -u "s/^/[$name] /") 2>&1 &
+  PIDS[$name]=$!
+}
+
+wait_prop() { # $1 name, $2 value, $3 timeout s
+  local f=$ROOT/dev/__omamobile_props__/$1 i
+  for ((i = 0; i < $3 * 10; i++)); do
+    [[ -f $f && $(cat "$f") == "$2" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+declare -A PIDS=()
+HBM_ATTR= NOTIFY_ATTR=
+
+start() {
+  local stage=${1:-bridge}
+  case $stage in listeners|hal|bridge) ;; *) die "unknown stage $stage" ;; esac
+  if [[ -z ${OMAMOBILE_FP_IN_NS:-} ]]; then
+    [[ -c /dev/goodix_fp ]] || modprobe goodix-fp || true
+    [[ -c /dev/qseecom ]] || modprobe qcom_qseecom_compat || true
+    udevadm settle -t 5 || true
+  fi
+  check
+  [[ $stage == bridge && ! -x $BRIDGE ]] && die "no bridge at $BRIDGE"
+  [[ $stage == bridge && -z $(touch_event) ]] && die "no touchscreen ($TOUCH_NAME)"
+  HBM_ATTR=$(hbm_attr) NOTIFY_ATTR=$(notify_attr)
+  if [[ -z ${OMAMOBILE_FP_IN_NS:-} ]]; then
+    if [[ -e $MARKER ]]; then
+      die "the stack already started this boot ($(cat "$MARKER" 2>/dev/null || true)): QSEE keeps its apps and listeners until a reboot. Reboot to start fingerprint again"
+    fi
+    install -d -m 0755 "$RUN"
+    local token
+    token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    (set -o noclobber; umask 077; echo "$(date -Is 2>/dev/null || date) pid $$ token $token" > "$MARKER") 2>/dev/null ||
+      die "the stack already started this boot (another start got there first)"
+    export OMAMOBILE_FP_TOKEN=$token
+    rm -f "$NSPID"
+    local fwd=()
+    unshare --help 2>/dev/null | grep -c -- '--forward-signals' >/dev/null && fwd=(--forward-signals)
+    exec unshare --mount --propagation private --pid --fork --kill-child "${fwd[@]}" \
+      env OMAMOBILE_FP_IN_NS=1 "$0" start "$stage"
+  fi
+  # only after this boot's marker, with its token
+  [[ ${OMAMOBILE_FP_TOKEN:-} =~ ^[0-9a-f]{32}$ && -f $MARKER && $(sed -n 's/.* token //p' "$MARKER") == "$OMAMOBILE_FP_TOKEN" ]] ||
+    die "the inner start runs only after the outer one (omamobile-fp-hotdog-chroot start)"
+  awk '/^NSpid:/ {print $2}' /proc/self/status > "$NSPID"
+  trap 'stop 0' TERM INT
+  trap 'stop $?' EXIT
+  setup
+  # a bridge that died with the panel lit leaves no HBM behind
+  [[ -n $HBM_ATTR ]] && echo 0 > "$HBM_ATTR" 2>/dev/null || true
+
+  spawn hwservicemanager system /system/bin/hwservicemanager
+  sleep 1
+  # qseecomd registers its listeners with QSEE, then sets this property
+  # (VERIFY the name in the owner's qseecomd; older builds:
+  # sys.listeners.registered).
+  spawn qseecomd vendor "$QSEECOMD"
+  wait_prop vendor.sys.listeners.registered true 30 ||
+    die "qseecomd did not report its listeners in 30 s (dmesg: qcom_qseecom_compat)"
+  say "listeners registered"
+
+  if [[ ${OMAMOBILE_FP_KEYS:-0} == 1 && $stage != listeners ]]; then
+    spawn keymaster vendor "$KEYMASTER"
+    spawn gatekeeper vendor "$GATEKEEPER"
+  fi
+
+  if [[ $stage == hal || $stage == bridge ]]; then
+    [[ -c $ROOT/dev/goodix_fp ]] || die "no /dev/goodix_fp in the chroot"
+    spawn fingerprint vendor "$FP_HAL"
+  fi
+
+  if [[ $stage == bridge ]]; then
+    # the system search order: the bridge links the platform's libhidlbase
+    spawn bridge system /omamobile/omamobile-fp-hotdog-bridge \
+      --socket /dev/socket/omamobile-fp/bridge.sock --touch /dev/input/touchscreen \
+      --state /data/vendor/omamobile-fp \
+      --hbm /sys/omamobile/hbm --notify /sys/omamobile/fp_notify \
+      --ui-state /dev/socket/omamobile-fp-ui/state.json \
+      --inhibit /dev/socket/omamobile-fp-ui/inhibit --panel "$PANEL" \
+      --sensor "$SENSOR" --hbm-first "$HBM_FIRST" --hat-mode "$HAT_MODE" \
+      ${OMAMOBILE_FP_HBM_SETTLE_MS:+--hbm-settle-ms "$OMAMOBILE_FP_HBM_SETTLE_MS"}
+  fi
+
+  say "stage $stage running"
+  wait -n || true
+  [[ -n $STOPPING ]] || say "a service exited"
+  stop 1
+}
+
+ns_pid() {
+  [[ -f $NSPID ]] || die "not running"
+  cat "$NSPID"
+}
+
+ns() {
+  (($#)) || die "usage: omamobile-fp-hotdog-chroot ns CMD..."
+  exec nsenter --target "$(ns_pid)" --mount --pid "$@"
+}
+
+run() {
+  (($#)) || die "usage: omamobile-fp-hotdog-chroot run /vendor/bin/... ARGS"
+  exec nsenter --target "$(ns_pid)" --mount --pid \
+    env -i LD_LIBRARY_PATH=$LIBS_VENDOR \
+    LD_PRELOAD="/omamobile/omamobile-fp-shim.so /omamobile/omamobile-fp-ion-shim.so" \
+    OMAMOBILE_FP_PROPS=/dev/__omamobile_props__ OMAMOBILE_FP_LOGLEVEL=2 \
+    "$CHROOT_BIN" "$ROOT" "$@"
+}
+
+case ${1:-} in
+  check) check ;;
+  paths) printf '%s\n' "image=$IMAGE" "state=$STATE" "run=$RUN" "uidir=$UIDIR" \
+           "qseecomd=$QSEECOMD" "hal=$FP_HAL" "ta_dirs=$TA_DIRS" "sensor=$SENSOR" \
+           "hbm=$(hbm_attr)" "notify=$(notify_attr)" ;;
+  start) start "${2:-bridge}" ;;
+  ns) shift; ns "$@" ;;
+  run) shift; run "$@" ;;
+  *) echo "usage: omamobile-fp-hotdog-chroot check | paths | start [listeners|hal|bridge] | ns CMD... | run CMD..." >&2
+     exit 2 ;;
+esac
