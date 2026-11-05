@@ -37,7 +37,8 @@ for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/b
     usr/lib/omamobile-fp-hotdog/omamobile-fp-hotdog-chroot usr/lib/omamobile-fp-hotdog/props-hotdog.conf \
     usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-hotdog.service \
     usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf \
-    usr/lib/modprobe.d/omamobile-fp-hotdog.conf etc/pam.d/omarchy-lock-fingerprint; do
+    usr/lib/modprobe.d/omamobile-fp-hotdog.conf etc/pam.d/omarchy-lock-fingerprint \
+    usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
 [[ $(readlink "$stage/etc/systemd/system/ModemManager.service") == /dev/null ]] || { echo "not ok - ModemManager not masked"; exit 1; }
