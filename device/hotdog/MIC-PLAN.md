@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Microphone plan (hotdog / SM8150): the built-in microphones
 
-**Status (2026-11-05): theoretical. Written and build-checked on the laptop;
-nothing has run on the phone, and nothing may until the owner approves each
-step below.** Kernel branch `omamobile-hotdog-mic` (worktree
+**Status (2026-11-05): works. The voice and recording microphones record
+through PipeWire from `boot_a` (M0-M8 in §7); AMIC1 and the kernel's
+24-bit capture are open.** Kernel branch `omamobile-hotdog-mic` (worktree
 `~/omamobile-kernel/wt-hotdog-mic`, output `~/omamobile-kernel/out-hotdog-mic`),
 three commits on top of `omamobile-hotdog-fingerprint` @ `41a6c1235` (the
 kernel the phone's `boot_a` came from). Overlay
@@ -263,7 +263,7 @@ tools/phone-ssh 'amixer -c 0 cset name="MultiMedia2 Mixer SLIMBUS_0_TX" 1
   amixer -c 0 cset name="AMIC4_5 SEL" AMIC4
   amixer -c 0 cset name="AMIC MUX0" ADC4
   amixer -c 0 cset name="ADC4 Volume" 12
-  amixer -c 0 cset name="DEC0 Volume" 0'
+  amixer -c 0 cset name="DEC0 Volume" 84'
 tools/phone-ssh 'arecord -D hw:0,1 -f S16_LE -r 48000 -c 2 -d 5 /tmp/mic-amic4-talk.wav; arecord -D hw:0,1 -f S16_LE -r 48000 -c 2 -d 5 /tmp/mic-amic4-quiet.wav; dmesg | tail -10'
 tools/phone-ssh 'cat /tmp/mic-amic4-talk.wav' > logs/mic-amic4-talk.wav
 tools/phone-ssh 'cat /tmp/mic-amic4-quiet.wav' > logs/mic-amic4-quiet.wav
@@ -322,7 +322,60 @@ overlay and build the next `boot_a` from that.
 
 ## 7. Results
 
-Nothing has run on the phone yet.
+**2026-11-05, on the phone, RAM boot** of the M2 image (overlay `mic`,
+`boot.img` sha256 `9c32c5ae…5779`), `uname -r`
+`7.3.0-rc6-omamobile-push1-gb743280ab222`; `boot_a` untouched.
+
+- M0: slot A `slot-successful` no, `retry-count` 6.
+- M1 (on `boot_a`'s kernel): ADSP, CDSP and modem running; **U1 answered:
+  service 769 (0x301) on node 5, the ADSP** (read with a Python QRTR
+  name-service lookup; the phone has no `qrtr-lookup`); GPIO 123 and 143
+  unclaimed; BoB 3032 mV, S4A 1800 mV; `ln_bb_clk2` at 19.2 MHz; the
+  routing control present.
+- M2: modules pushed next to the running tree; blacklist file written.
+- M3: `slim-qcom-ngd-ctrl` probed: `SLIM SAT: Rcvd master capability`,
+  `SLIM controller Registered`, devices `217:250:0:0` and `217:250:1:0`.
+  **U2 and U3 answered**: SID 0x1b46 alone and BAM pipes 3/4 are enough,
+  no SMMU fault, no timeout. SMMU faults on SIDs 0x800/0xc20 at 1.16 s
+  come before anything of this plan loads.
+- M4: `WCD934x chip id major 0x108, minor 0x1`, `Version:0x411`, no efuse
+  warning; the card registered with `pcmC0D1c`; the codec holds BoB
+  (`vdd-micbias`), `ln_bb_clk2` (`extclk`) and GPIO 123/143. A burst of 18
+  `SLIM SAT: Rcvd master capability` lines during the codec's start, then
+  none. **U5:** MBHC ran its impedance check, logged `Impedance detect ramp
+  error` and `MONO plug type detected`, and `Headset Jack` reads on with
+  nothing plugged in (the phone has no jack); no interrupt storm. Watch
+  item: nothing routes a headset, so nothing acts on it yet.
+- M5: the first take was digital silence: `DEC0 Volume` 0 is -84 dB on
+  mainline's control (`min=0,max=124`, register 0xac); **84 is 0 dB**, as
+  on stock. Fixed in the runbook and the UCM. At 84, AMIC4 (ADC4 gain
+  12): quiet -71 dBFS, speech -50 to -58 dBFS per second, peak -32 dBFS;
+  the owner listened: speech, clean. Both channels carry the same samples.
+  The AMIC4 TX hold bit (0x611 bit 5) stays set (mainline sets it at the
+  ADC's power-up and never clears it); the mics record anyway. Each take
+  ends with `underflow error on TX port 0, value 6`, harmless so far.
+- M6: AMIC3 (ADC3 gain 12): quiet -74 dBFS, speech -45 to -63 dBFS, peak
+  -19 dBFS, loudest from the bottom edge. AMIC1: not taken yet.
+- M7: device-hotdog 0.1.3 then 0.1.4 installed; `alsaucm` lists Speaker,
+  Mic1 and Mic2; PipeWire offers "HiFi (Mic1, Speaker)" (active) and
+  "HiFi (Mic2, Speaker)". **PipeWire's first take was full-scale noise:**
+  it opened `hw:0,1` at S24_LE, and asked for S24_LE the ADSP hands back
+  the 16-bit samples left-justified in 32-bit words (an S32 layout; raw
+  `arecord -f S24_LE` shows `0xffa90000`-style words). S16_LE is clean.
+  device-hotdog 0.1.4 pins the capture node to S16LE with a WirePlumber
+  rule; `pw-record` is then clean. The kernel side (q6asm-dai capture at
+  24 bits behind a 16-bit back end) is open. PipeWire drives `ADC4` as
+  the source's volume (100 % = gain 20).
+- M8 (the owner tested playback and recording, then gave the go): the
+  blacklist file removed; `fastboot flash boot_a` of the RAM-booted image
+  (slot A `retry-count` 6 before, 7 after, `slot-successful` still no);
+  `boot_a` (`sde11`) read back from Linux: sha256 `9c32c5ae…5779`, equal.
+  At boot the modules load by themselves: `SLIM controller Registered` at
+  6.9 s, the codec at 6.9 s, the card with `pcmC0D1c`, PipeWire's "Voice
+  microphone" source, fingerprint active; `pw-record` gives 16-bit audio.
+  New in this boot: `QMI wait timeout` from the NGD at 7.9 s, after the
+  codec came up; recording works after it (watch item). Rollback image:
+  `boot-fp-g41a6c1235a0b.img` (sha256 `14fe1d55…be79`).
 
 **2026-11-05, laptop only:** stock facts in §0 read from the owner's
 OxygenOS dtbo and vendor image; three kernel commits on
