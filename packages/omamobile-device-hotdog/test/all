@@ -5,7 +5,7 @@
 # the phone needs.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-for f in build install bin/*; do bash -n "$f"; done
+for f in build install bin/* lib/omamobile-fp-hotdog-chroot; do bash -n "$f"; done
 echo "ok - scripts parse"
 for l in vendor/systemd/system/*.wants/*; do
   [[ -f vendor/systemd/system/$(basename "$(readlink "$l")") ]] || { echo "not ok - $l has no unit"; exit 1; }
@@ -26,9 +26,20 @@ trap 'rm -rf "$stage" "$build"' EXIT
 for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/bin/omamobile-hotdog-bt-addr \
     usr/lib/systemd/system/multi-user.target.wants/omamobile-rmtfs.service \
     usr/lib/udev/rules.d/10-omamobile-storage.rules etc/pacman.d/omamobile-mirrorlist \
-    "usr/share/alsa/ucm2/conf.d/sm8150/OnePlus 7T Pro.conf" usr/share/alsa/ucm2/OnePlus/hotdog/HiFi.conf; do
+    "usr/share/alsa/ucm2/conf.d/sm8150/OnePlus 7T Pro.conf" usr/share/alsa/ucm2/OnePlus/hotdog/HiFi.conf \
+    usr/lib/omamobile-fp-hotdog/omamobile-fp-hotdog-chroot usr/lib/omamobile-fp-hotdog/props-hotdog.conf \
+    usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-hotdog.service \
+    usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf \
+    usr/lib/modprobe.d/omamobile-fp-hotdog.conf etc/pam.d/omarchy-lock-fingerprint; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
 [[ $(readlink "$stage/etc/systemd/system/ModemManager.service") == /dev/null ]] || { echo "not ok - ModemManager not masked"; exit 1; }
 [[ $(readlink "$stage/etc/systemd/system/systemd-firstboot.service") == /dev/null ]] || { echo "not ok - systemd-firstboot not masked"; exit 1; }
 echo "ok - staged install"
+# Fingerprint: the compat driver loads only the two trusted apps, and the
+# unit never restarts (QSEE keeps an app until a reboot)
+grep -cx 'options qcom_qseecom_compat app_allowlist=gfp9558,keymaster64 .*' vendor/modprobe.d/omamobile-fp-hotdog.conf >/dev/null ||
+  { echo "not ok - qseecom allow-list"; exit 1; }
+grep -cx 'Restart=no' vendor/systemd/system/omamobile-fp-hotdog.service >/dev/null ||
+  { echo "not ok - omamobile-fp-hotdog must not restart"; exit 1; }
+echo "ok - fingerprint"
