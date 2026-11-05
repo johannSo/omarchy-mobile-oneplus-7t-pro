@@ -169,14 +169,14 @@ KERNEL_OUT=~/omamobile-kernel/out-hotdog-fingerprint \
   DEVICE=hotdog bin/omamobile kernel
 ```
 
-The two modules aren't in `device/hotdog/kernel.config`. Until the plan
-passes they come from [`kernel-fingerprint.config`](kernel-fingerprint.config),
-merged into `$KERNEL_OUT/.config` by hand before that build's `olddefconfig`
-(the file says how).
-
-The DT nodes are `disabled`, so this kernel without the overlays boots
-like `omamobile-hotdog`. The compat module binds nothing without
-`qseecom-compat.dtso`, and goodix-fp binds nothing without `fp-sensor.dtso`.
+Since the plan passed (section 7), `device/hotdog/kernel.config` has
+`CONFIG_QCOM_QSEECOM_COMPAT=m` (goodix-fp comes from `omamobile.config`),
+and the DT enables the sensor, its supply switch and `qseecom-compat`, with
+the sensor's SPI pins and clocks on the `fingerprint` node (goodix-fp keeps
+them on while the sensor is powered). The bring-up overlays in `overlays/`
+are no longer needed. Both modules autoload; the compat driver's
+allow-lists come from `omamobile-device-hotdog`'s modprobe options, and the
+stack starts from `omamobile-fp-hotdog.service`.
 
 ## 6. Runbook
 
@@ -313,7 +313,18 @@ comes only after F10 passes.
 
 ## 7. Results
 
-Nothing has run on the phone yet.
+**2026-11-05, the stack from the kernel and the package**
+(`7.3.0-rc6-omamobile-push1-g41a6c1235a0b`, `omamobile-device-hotdog`
+0.1.2): `boot_a` flashed with that kernel (fastboot, tries back to 7), no
+bring-up overlays or hand-loaded modules. At boot the DT's `/fingerprint`
+and `/qseecom-compat` bound, `goodix-fp` switched the supply on,
+`omamobile-fp-hotdog.service` started from its wants link and loaded
+`gfp9558` (app id 3), and the HAL reported `spmt is pass`. The lock screen
+asked fprintd at once; the first touch was `NOT_LIVE_FINGER` (quality 15),
+the second matched (quality 36) and the owner was unlocked. On the old
+kernel (`g5f2e6c289701`, nodes disabled) the same package's unit waited 90 s
+for `/dev/goodix_fp` and `/dev/qseecom` and failed: the stack needs this
+kernel.
 
 **2026-11-04, owner's decision on RPMB (F7):** yes. Asked with the facts:
 QSEE's Gatekeeper (in `keymaster64`, which the fingerprint TA trusts for
