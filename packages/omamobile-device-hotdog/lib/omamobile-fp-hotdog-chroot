@@ -83,6 +83,12 @@ SENSOR=${OMAMOBILE_FP_SENSOR:-720,2728,110}
 PANEL=1440x3120
 HBM_FIRST=${OMAMOBILE_FP_HBM_FIRST:-0}
 HAT_MODE=${OMAMOBILE_FP_HAT_MODE:-gatekeeper}
+# How long the bridge waits with the panel at full brightness before it
+# tells the HAL the finger is lit: 300 ms gave clean captures (section 7)
+HBM_SETTLE_MS=${OMAMOBILE_FP_HBM_SETTLE_MS:-300}
+# At boot the unit can start before udev has loaded the drivers: wait this
+# long for the nodes, the touchscreen and the panel's hbm attribute
+WAIT_DEVICES_S=${OMAMOBILE_FP_WAIT_DEVICES_S:-90}
 # libQSEEComAPI allocates from qsecom (27) and qsecom_ta (19); OnePlus's
 # HAL also takes 4 MiB from the secure carve-out heap (14, flag CP_CDSP)
 # in CaEntry::startTap and fails its start without it. All three come from
@@ -441,6 +447,13 @@ start() {
     [[ -c /dev/goodix_fp ]] || modprobe goodix-fp || true
     [[ -c /dev/qseecom ]] || modprobe qcom_qseecom_compat || true
     udevadm settle -t 5 || true
+    local waited=0
+    until [[ -c /dev/goodix_fp && -c /dev/qseecom && -n $(touch_event) && -n $(hbm_attr) ]]; do
+      ((waited < WAIT_DEVICES_S)) || { say "devices still missing after ${WAIT_DEVICES_S} s"; break; }
+      ((waited % 10)) || say "waiting for /dev/goodix_fp, /dev/qseecom, the touchscreen and the panel's hbm"
+      sleep 1
+      waited=$((waited + 1))
+    done
   fi
   check
   [[ $stage == bridge && ! -x $BRIDGE ]] && die "no bridge at $BRIDGE"
@@ -506,7 +519,7 @@ start() {
       --ui-state /dev/socket/omamobile-fp-ui/state.json \
       --inhibit /dev/socket/omamobile-fp-ui/inhibit --panel "$PANEL" \
       --sensor "$SENSOR" --hbm-first "$HBM_FIRST" --hat-mode "$HAT_MODE" \
-      ${OMAMOBILE_FP_HBM_SETTLE_MS:+--hbm-settle-ms "$OMAMOBILE_FP_HBM_SETTLE_MS"}
+      --hbm-settle-ms "$HBM_SETTLE_MS"
   fi
 
   say "stage $stage running"

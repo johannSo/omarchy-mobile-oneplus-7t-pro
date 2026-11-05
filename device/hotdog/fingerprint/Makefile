@@ -12,7 +12,9 @@
 #   out/omamobile-fp-shim.so          the Pixel stack's property shim, at
 #                                     Android 10's API level
 #
-#   make NDK=~/Android/Sdk/ndk/<version>
+#   make NDK=~/Android/Sdk/ndk/<version> OUT=<checkout>/packages/omamobile-device-hotdog/prebuilt
+#
+# (omamobile-device-hotdog's install packages them from there)
 #
 # Nothing links against the vendor's C++: the bridge reaches the HAL
 # through its C ABI (fingerprint_device_t) and Gatekeeper through plain
