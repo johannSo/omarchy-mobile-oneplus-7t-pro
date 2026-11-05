@@ -7,6 +7,14 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 for f in build install bin/* lib/omamobile-fp-hotdog-chroot; do bash -n "$f"; done
 echo "ok - scripts parse"
+for f in libexec/*; do
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
+done
+grep -c "ALLOWED_HALL_WRITES = {0x00, 0x01, 0x07, 0x08}" libexec/omamobile-hotdog-popup >/dev/null ||
+  { echo "not ok - the pop-up tool may write more hall sensor registers than its reset and setup"; exit 1; }
+[[ ! -e vendor/systemd/system/multi-user.target.wants/omamobile-hotdog-popup.service ]] ||
+  { echo "not ok - the pop-up service must not be enabled by the package"; exit 1; }
+echo "ok - pop-up tool parses, stays off by default"
 for l in vendor/systemd/system/*.wants/*; do
   [[ -f vendor/systemd/system/$(basename "$(readlink "$l")") ]] || { echo "not ok - $l has no unit"; exit 1; }
 done
@@ -38,7 +46,8 @@ for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/b
     usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-hotdog.service \
     usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf \
     usr/lib/modprobe.d/omamobile-fp-hotdog.conf etc/pam.d/omarchy-lock-fingerprint \
-    usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf; do
+    usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf \
+    usr/lib/omamobile/hotdog/omamobile-hotdog-popup usr/lib/systemd/system/omamobile-hotdog-popup.service; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
 [[ $(readlink "$stage/etc/systemd/system/ModemManager.service") == /dev/null ]] || { echo "not ok - ModemManager not masked"; exit 1; }
