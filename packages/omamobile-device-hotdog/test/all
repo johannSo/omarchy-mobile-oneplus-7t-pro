@@ -19,6 +19,13 @@ for p in modemst1 modemst2 fsg fsc oem_stanvbk oem_dycnvbk persist; do
     { echo "not ok - $p is not set read-only by udev"; exit 1; }
 done
 echo "ok - NV partitions read-only"
+# The microphones need the mic overlay and the codec's modules. Without
+# them the speakers' verb must still load, so every codec control the UCM
+# sets sits under the ControlExists condition.
+awk '/^If\.mic \{/ { inmic = 1 } !inmic && !/^[[:space:]]*#/ && /AIF1_CAP|AMIC|ADC[0-9]|DEC[0-9]|SLIMBUS/ { bad = 1 } END { exit bad }' \
+    ucm2/OnePlus/hotdog/HiFi.conf ||
+  { echo "not ok - a codec control in HiFi.conf outside If.mic"; exit 1; }
+echo "ok - UCM capture half conditional"
 stage=$(mktemp -d) build=$(mktemp -d)
 trap 'rm -rf "$stage" "$build"' EXIT
 : > "$build/rmtfs"; : > "$build/tqftpserv"
