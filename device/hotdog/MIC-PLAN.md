@@ -8,7 +8,7 @@ step below.** Kernel branch `omamobile-hotdog-mic` (worktree
 three commits on top of `omamobile-hotdog-fingerprint` @ `41a6c1235` (the
 kernel the phone's `boot_a` came from). Overlay
 [`overlays/mic.dtso`](overlays/mic.dtso). UCM in
-`packages/omamobile-device-hotdog` 0.1.2.
+`packages/omamobile-device-hotdog` 0.1.3.
 
 **Goal.** The phone's built-in microphones record through PipeWire as two
 sources, "Voice microphone" and "Recording microphone", next to the
@@ -146,12 +146,9 @@ route nothing turns MCLK on for a capture.
 ## 5. Kernel build
 
 ```sh
-# the fingerprint options too, as the running kernel has them (temporary,
-# do not commit the appended kernel.config)
-cat device/hotdog/kernel-fingerprint.config >> device/hotdog/kernel.config
+# kernel.config carries the fingerprint options, as the boot_a kernel has
 DEVICE=hotdog KERNEL_DIR=~/omamobile-kernel/wt-hotdog-mic \
   KERNEL_OUT=~/omamobile-kernel/out-hotdog-mic bin/omamobile kernel
-git checkout device/hotdog/kernel.config
 DEVICE=hotdog KERNEL_OUT=~/omamobile-kernel/out-hotdog-mic bin/omamobile modules
 DEVICE=hotdog KERNEL_OUT=~/omamobile-kernel/out-hotdog-mic bin/omamobile initramfs
 # DTB_OVERLAYS="mic" in device/hotdog/device.conf for this build only
@@ -213,11 +210,10 @@ tools/phone-ssh 'printf "%s\n" "# MIC-PLAN M3: the step loads it by hand" \
 
 ### M3: RAM boot with the overlay, SLIMbus up (one boot; risk low)
 
-Announce: the speakers are missing in this boot until M4, and fingerprint
-unlock is off for the whole test boot (its bring-up pieces in
-`/root/fp-bringup`, an out-of-tree module among them, are built for the
-running kernel; unlock with the PIN). The owner brings the phone to
-fastboot by the buttons, then:
+Announce: the speakers are missing in this boot until M4. Fingerprint
+unlock should work as from `boot_a` (the test kernel has the same base, DT
+and fingerprint modules, and device-hotdog runs it); if it doesn't, use the
+PIN. The owner brings the phone to fastboot by the buttons, then:
 
 ```sh
 fastboot boot ~/omamobile-kernel/out-hotdog-mic/images/boot.img
@@ -303,7 +299,7 @@ each take, to find which mic is where.
 
 - **Pass:** both record live signal; their positions recorded in §7.
 
-### M7: UCM and PipeWire (device package 0.1.2; risk low)
+### M7: UCM and PipeWire (device package 0.1.3; risk low)
 
 ```sh
 tools/phone-install-package packages/omamobile-device-hotdog
@@ -315,7 +311,7 @@ tools/phone-ssh 'su - <user> -c "systemctl --user restart wireplumber pipewire p
   "Voice microphone" and "Recording microphone" sources; a `pw-record`
   from each is speech; the speakers still play.
 - **Stop** if the speakers' sink is gone (the verb broke): roll back.
-- **Rollback:** reinstall device-hotdog 0.1.1 (the speakers' UCM alone).
+- **Rollback:** reinstall device-hotdog 0.1.2 (the speakers' UCM alone).
 
 ### M8: making it stay (owner's decision 2)
 
