@@ -20,9 +20,9 @@ libfprint's `omamobile_udfps` driver, fprintd's drop-in and the shell's
 | `omamobile-fp-ion-shim.c` | LD_PRELOAD library: `/dev/ion` for libQSEEComAPI and libion, made from `qcom_qseecom_compat`'s `QSEECOM_COMPAT_IOCTL_ALLOC` dma-bufs. It handles the new (4.12+) and the legacy handle ion ABI, and only the `qsecom` and `qsecom_ta` heaps |
 | `omamobile-fp-hotdog-bridge.cpp` | Client of HIDL `android.hardware.biometrics.fingerprint@2.1`. It serves the Pixel bridge's line protocol, reads the touchscreen, switches the panel's HBM and sends goodix-fp `notify` events |
 | `Makefile` | Builds the shim with the NDK. The shim and the bridge build with an AOSP or LineageOS tree, its prebuilt clang, its libc++ and hidl-gen headers. Both link against the extracted chroot |
-| `omamobile-fp-hotdog-chroot` | The runner: preconditions and the safety refusals, the chroot in private mount and PID namespaces, and the start order hwservicemanager -> qseecomd -> HAL -> bridge. It stops in reverse order and starts once per boot |
-| `omamobile-fp-hotdog.service` | The unit. It has no `[Install]` section and is not enabled anywhere |
-| `props-hotdog.conf` | Property placeholders for the chroot |
+| `omamobile-fp-hotdog-chroot` (in `packages/omamobile-device-hotdog/lib/`) | The runner: preconditions and the safety refusals, the chroot in private mount and PID namespaces, and the start order hwservicemanager -> qseecomd -> HAL -> bridge. It stops in reverse order and starts once per boot |
+| `omamobile-fp-hotdog.service` (in the package's `vendor/systemd/system/`) | The unit, enabled by the package; inert until the owner's files are in `/usr/lib/omamobile-fp-hotdog/root` |
+| `props-hotdog.conf` (in the package's `lib/`) | Property placeholders for the chroot |
 
 ## Data flow
 
@@ -109,9 +109,12 @@ The props, logging and SELinux shim is the Pixel one, built from
 `LD_PRELOAD="omamobile-fp-shim.so omamobile-fp-ion-shim.so"`. The shim's
 header explains how the two `ioctl()` wrappers chain.
 
-The install layout the runner expects (by hand, in the plan's runbook):
-`/usr/lib/omamobile-fp-hotdog/{root/,omamobile-fp-shim.so,omamobile-fp-ion-shim.so,omamobile-fp-hotdog-bridge,omamobile-fp-hotdog-chroot,props-hotdog.conf}`
-and the unit in `/etc/systemd/system/` while it is staged.
+The install layout: `omamobile-device-hotdog` (0.1.2+) installs
+`/usr/lib/omamobile-fp-hotdog/{omamobile-fp-shim.so,omamobile-fp-ion-shim.so,omamobile-fp-hotdog-bridge,omamobile-fp-hotdog-chroot,props-hotdog.conf}`,
+the unit (enabled), the compat driver's modprobe options, fprintd's drop-in
+and the lock screen's PAM file. Build the three programs into the package
+first: `make NDK=... OUT=$PWD/../../../packages/omamobile-device-hotdog/prebuilt`.
+Only `root/`, the owner's OxygenOS files, is copied by hand.
 
 ## What was checked offline (2026-11-04)
 

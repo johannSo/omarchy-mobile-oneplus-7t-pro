@@ -30,7 +30,27 @@ ln -sfn /dev/null "$destination/etc/systemd/system/ModemManager.service"
 # it runs before sysinit.target, so it held sshd and omamobile-firstboot
 # (H3, 2026-11-04). omamobile-firstboot sets all of that from firstboot.conf.
 ln -sfn /dev/null "$destination/etc/systemd/system/systemd-firstboot.service"
+# The microphones' capture format (the ADSP's S24 capture is misaligned)
+install -Dm644 wireplumber/51-omamobile-hotdog-mic.conf \
+  "$destination/usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf"
 install -Dm644 etc/omamobile-mirrorlist "$destination/etc/pacman.d/omamobile-mirrorlist"
+# Fingerprint (device/hotdog/FINGERPRINT-PLAN.md): the runner, its property
+# file and the bionic programs built on the computer with the NDK
+#   make -C device/hotdog/fingerprint NDK=... OUT=$PWD/packages/omamobile-device-hotdog/prebuilt
+# The owner's OxygenOS files (root/) are never packaged. Without the
+# programs the package still installs, and the unit's conditions keep
+# fingerprint off.
+fp=$destination/usr/lib/omamobile-fp-hotdog
+install -Dm755 lib/omamobile-fp-hotdog-chroot "$fp/omamobile-fp-hotdog-chroot"
+install -Dm644 lib/props-hotdog.conf "$fp/props-hotdog.conf"
+if [[ -d prebuilt ]]; then
+  install -Dm644 prebuilt/omamobile-fp-shim.so "$fp/omamobile-fp-shim.so"
+  install -Dm644 prebuilt/omamobile-fp-ion-shim.so "$fp/omamobile-fp-ion-shim.so"
+  install -Dm755 prebuilt/omamobile-fp-hotdog-bridge "$fp/omamobile-fp-hotdog-bridge"
+else
+  echo "install: no prebuilt/ (device/hotdog/fingerprint/Makefile): packaging without fingerprint" >&2
+fi
+install -Dm644 etc/pam.d/omarchy-lock-fingerprint "$destination/etc/pam.d/omarchy-lock-fingerprint"
 install -Dm644 LICENSE "$destination/usr/share/licenses/omamobile-device-hotdog/LICENSE"
 install -Dm644 LICENSE.Apache-2.0 "$destination/usr/share/licenses/omamobile-device-hotdog/LICENSE.Apache-2.0"
 install -Dm644 version "$destination/usr/share/omamobile/device-hotdog/version"
