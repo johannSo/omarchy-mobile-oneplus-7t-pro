@@ -197,7 +197,10 @@ ALLOWED_HALL_WRITES = {0x00, 0x01, 0x07, 0x08}
 
 class Hall:
     def __init__(self):
-        buses = [b for b in glob.glob("/sys/class/i2c-adapter/i2c-*")
+        # Kernel 7.3 has no /sys/class/i2c-adapter: the adapters are only on
+        # the bus (CAMERA-PLAN P1, 2026-11-05); older kernels have both
+        buses = [b for b in sorted(set(glob.glob("/sys/bus/i2c/devices/i2c-*") +
+                                       glob.glob("/sys/class/i2c-adapter/i2c-*")))
                  if of_path(b).endswith(HALL_BUS)]
         if not buses:
             raise SystemExit("popup: hall sensor bus i2c@884000 not enabled (overlay missing?)")

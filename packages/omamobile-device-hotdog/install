@@ -34,6 +34,8 @@ ln -sfn /dev/null "$destination/etc/systemd/system/systemd-firstboot.service"
 # The microphones' capture format (the ADSP's S24 capture is misaligned)
 install -Dm644 wireplumber/51-omamobile-hotdog-mic.conf \
   "$destination/usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf"
+# The cameras' software ISP runs on the CPU (CAMERA-PLAN C8)
+install -Dm644 libcamera/configuration.yaml "$destination/usr/share/libcamera/configuration.yaml"
 install -Dm644 etc/omamobile-mirrorlist "$destination/etc/pacman.d/omamobile-mirrorlist"
 # Fingerprint (device/hotdog/FINGERPRINT-PLAN.md): the runner, its property
 # file and the bionic programs built on the computer with the NDK

@@ -47,12 +47,19 @@ for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/b
     usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf \
     usr/lib/modprobe.d/omamobile-fp-hotdog.conf etc/pam.d/omarchy-lock-fingerprint \
     usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf \
-    usr/lib/omamobile/hotdog/omamobile-hotdog-popup usr/lib/systemd/system/omamobile-hotdog-popup.service; do
+    usr/lib/omamobile/hotdog/omamobile-hotdog-popup usr/lib/systemd/system/omamobile-hotdog-popup.service \
+    usr/lib/udev/rules.d/70-omamobile-dma-heap.rules usr/share/libcamera/configuration.yaml; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
 [[ $(readlink "$stage/etc/systemd/system/ModemManager.service") == /dev/null ]] || { echo "not ok - ModemManager not masked"; exit 1; }
 [[ $(readlink "$stage/etc/systemd/system/systemd-firstboot.service") == /dev/null ]] || { echo "not ok - systemd-firstboot not masked"; exit 1; }
 echo "ok - staged install"
+# The cameras: the CPU debayer (the GPU one gives zero frames on this GPU),
+# and the user's session may allocate the ISP's buffers
+grep -cx '    mode: gpu' libcamera/configuration.yaml >/dev/null || { echo "not ok - libcamera software ISP mode"; exit 1; }
+grep -c 'SUBSYSTEM=="dma_heap".*GROUP="video".*TAG+="uaccess"' vendor/udev/rules.d/70-omamobile-dma-heap.rules >/dev/null ||
+  { echo "not ok - dma-heap access"; exit 1; }
+echo "ok - camera software ISP"
 # Fingerprint: the compat driver loads only the two trusted apps, and the
 # unit never restarts (QSEE keeps an app until a reboot)
 grep -cx 'options qcom_qseecom_compat app_allowlist=gfp9558,keymaster64 .*' vendor/modprobe.d/omamobile-fp-hotdog.conf >/dev/null ||
