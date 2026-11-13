@@ -490,7 +490,186 @@ decision 5.
 
 ## 7. Results
 
-Nothing has run on the phone yet.
+**2026-11-05, RAM boot 1 (`7.3.0-rc6-omamobile-push1-g43b7e8ece3ad`,
+overlays torch, camera and popup): T1, C0-C6 pass; the D-PHY cameras give
+images.**
+
+- **C0:** only `camcc_sm8150` loaded, nothing bound; none of the camera or
+  motor pins claimed; battery 53 %. `slot-retry-count:a` 5 before and after
+  both RAM boots: `fastboot boot` spends no slot-A try.
+- **C1:** the module tree, the blacklist and both tables (sha256 read back).
+- **First RAM boot hung:** the initramfs answered SSH after 44 s, switched
+  root, and Arch never opened port 22 (ping answered, the panel black, more
+  than 12 minutes). It left no journal at all (no entry in `--list-boots`,
+  no pstore), so it stopped before the journal flush. The same image with
+  `systemd.debug_shell=ttyGS0` added booted cleanly (SSH 10 s), so the hang
+  is intermittent, the same symptom as BRINGUP-M1's 2026-11-04 boot of the
+  fingerprint kernel. Test images now carry the debug shell (a root shell on
+  the laptop's `/dev/ttyACM0`) so the next one can be read.
+- **T1:** `white:torch`, `max_brightness` 255. **T2:** dim 2 s, full 5 s,
+  `brightness` 0 afterwards, no fault in the log; the owner's sighting is
+  not recorded yet.
+- **C2:** four `Qualcomm-CCI` adapters (i2c-4 to i2c-7), no clock or GDSC
+  error.
+- **C3:** `s5k3m5 4-0010` probes (`afvdd` dummy: no actuator supply in the
+  DT yet).
+- **C4:** `imx471 6-0010` probes; `sony-fwtable 7-001a: IMX481, 1 modes
+  from the tables`.
+- **C5:** CAMSS probes; the sensors link to CSIPHY0 (tele), 2 (front) and 3
+  (wide); four CSIDs, VFEs with RDI0-2 and PIX. The only SMMU faults in the
+  log are at 1.1 s of boot, before CAMSS loaded (SIDs 0x800, 0xc20).
+- **C6, through CSID0 and VFE0 RDI0:**
+  - telephoto 4208x3120 `pgAA` at 30.00 fps, no CSID error; its colour bars
+    (`test_pattern=2`) arrive whole, Bayer order GRBG as expected. With the
+    phone on its back it read only the pedestal (64) even at exposure 3300
+    and gain 16, which first looked like a dead analog rail; streaming, the
+    rails read on (GPIO 148 high, `cam_tele_vana`, L2F, L1C) and reset
+    released (GPIO 28 high). Pointed at the room: light (mean 77-118 per
+    phase at exposure 1600, gain 4), a wall out of focus (no actuator);
+  - ultrawide 4656x3496 `pRAA` at 30.1 fps: a recognisable picture of the
+    room (exposure 3000, `analogue_gain` 480), upside down and green as raw
+    frames are;
+  - front 1928x1088 `pRAA` at 57.8 fps, no error; the pedestal only (the
+    pop-up is down). Its test pattern does nothing: the upstream `imx471`
+    driver writes the pattern code as `CCI_REG8(0x0600)`, the high byte of
+    the 16-bit SMIA register 0x0600-0x0601, so the mode byte stays 0.
+- **C8, libcamera 0.7.2-4.23** (built and installed on the phone with
+  `tools/phone-install-package`, which also installed `libcamera-tools`):
+  `cam -l` lists the three D-PHY cameras (two back, one front). The
+  sensor helpers warn that `imx471` and `s5k3m5` give no crop rectangles
+  (harmless). Two fixes before a user session gets a picture:
+  - **The GPU debayer gives all-zero frames** on the Adreno 640 (FD640,
+    Mesa 26.2.6), also with `copy_input_buffer: true`; AGC then runs to
+    gain 16 and 33 ms. No GPU fault, but closing the imported buffers logs
+    `io-pgtable-arm.c:673` unmap warnings from `msm_gem_close` (36-37 per
+    capture). The CPU debayer is correct (white-balanced, exposed) at
+    30 fps for 1920x1440 from the ultrawide, as on the Pixel 4 (the same
+    SoC and GPU). device-hotdog 0.1.6 ships `software_isp.mode: cpu` as
+    `/usr/share/libcamera/configuration.yaml`.
+  - **As the user, no software ISP at all** ("Could not open any dma-buf
+    provider"): the DMA-BUF heaps are root-only. device-hotdog 0.1.6 ships
+    cheetah's and tegu's `70-omamobile-dma-heap.rules`.
+  - On the phone, until 0.1.6 is installed: `/etc/libcamera/configuration.yaml`
+    and `/etc/udev/rules.d/70-omamobile-camera-hotdog-bringup.rules`
+    (bring-up copies; remove both when the package is installed).
+  - `omacam --list` as the user: `main` = IMX481 (the ultrawide, until the
+    IMX586 works), `front` = IMX471, the S5K3M5 unused.
+  - The owner saw the pictures in omacam: upside down, blurry and flat.
+    Causes: the ultrawide's DT rotation (270, should be 90: stock's roll
+    270/yaw 0 is the others' roll 90/yaw 180), no focus drivers, the
+    identity CCM, and the CPU debayer only crops (a 1920x1440 viewfinder is
+    a centre crop of the full sensor frame; it needs binned modes).
+- **Colour tuning (laptop, private):** stock's CCMs, AWB points and
+  shading tables decoded from the owner's
+  `com.qti.tuned.*.bin` into `~/android/reference/hotdog/tuning/` (never
+  committed: derived from Qualcomm's data). On the phone in `/tmp/hdtune`
+  only (lost at reboot); A/B on the ultrawide loaded (`Using tuning file
+  /tmp/hdtune/simple/imx481.yaml`) and is more neutral; the owner's verdict
+  is open. Keep: `install -Dm644 -t /etc/libcamera/ipa/simple/`.
+- **P0-P2 pass:** i2c@884000 is i2c-0; the LPG is `pwmchip0` (5 channels);
+  both hall sensors answer, `down up=-11 down=-325` three times (thresholds
+  150). The pop-up tool looked for `/sys/class/i2c-adapter`, which 7.3 no
+  longer has: fixed (device-hotdog 0.1.6). P3 (first move) not run yet.
+
+**2026-11-05 evening, the combined test kernel (`7.3.0-rc6-omamobile-push1-gc65cd2d1979f`,
+branch `omamobile-hotdog-af` = `omamobile-hotdog-cphy` + focus + two fixes,
+`out-hotdog-af`; overlays torch, camera, popup, camera-main, camera-af):
+built, modules pushed, never reached Arch.**
+
+- Focus (laptop): main and tele are one dual module; SEMCO uses an
+  LC898217XC at 0x72 (main) and 0x74 (tele), O-film an AK7374 at 0x2d and
+  0x74; the ultrawide an AK7374 at 0x0c. 10-bit position; stock travels
+  codes 50-930. The DT assumes SEMCO (the first test settles it). Commits:
+  AK7374 in `ak7375`, a new `lc898217xc` driver, `v4l2-fwnode` skipping
+  disabled lens references, the DT, the ultrawide rotation 90, and the
+  IMX471 test pattern as a 16-bit write. `slot-retry-count:a` read 4 at
+  this boot (5 earlier: one `boot_a` boot happened in between).
+- **Two RAM boots in a row hung**: black panel, ping answers, SSH refused,
+  the serial debug shell silent; the second one reached the initramfs SSH
+  only after 149 s (normally 5-44 s), then froze after `switch_root`.
+  Hypothesis: the panel stalls after a RAM boot from the fastboot screen
+  (initramfs/init's note: "a stalled panel flooded the console"), and
+  console writes to it (`console=tty0`, the init's `say` to `/dev/tty0`)
+  block, so systemd freezes at its first console write. A third image with
+  `console=null` (same kernel and overlays, `out-hotdog-af/images/boot.img`,
+  sha256 `ccb971ab…`; the tty0 one kept as `boot-tty0.img`) is built and
+  untested.
+- **Next:** RAM-boot the `console=null` image; C7 (IMX586, C-PHY); the
+  focus test (which module maker, then `focus_absolute` 50-930 with the
+  subdev held open); libcamera AF; the owner's tuning verdict; binned
+  modes for the viewfinder; P3-P5 (the pop-up, announce each move).
+
+**2026-11-12, the `console=null` image (`gc65cd2d1979f`, RAM boot): boots,
+system `running` at 4 min. C7 and the focus test pass.**
+
+- This boot, with the same kernel and overlays, came up clean. (Not proof
+  that the console caused the hangs: see the `geaa88b840c8e` boot below.)
+- **C7:** `sony-fwtable 5-001a: IMX586, 2 modes from the tables` (8000x6000
+  skipped: its link frequency isn't in the DT); `cam -c 2` streams
+  2000x1500 at 30 fps over CSIPHY1 C-PHY with no CSID errors, and the
+  picture is clean (the owner's desk).
+- **Focus:** both LC898217XC answer (0x72, 0x74): the module is **SEMCO**.
+  Each logs `status still 0x20 after power-up` (stock polls 0xb3 for 0 for
+  10 ms; the lens moves anyway: the bit's meaning is open). The AK7374 at
+  0x0c answers silently. `focus_absolute` 0/300/600/930 on the main lens
+  visibly moves the focus. libcamera lists AF controls for all three back
+  cameras.
+- **Orientation:** `cam` frames are never rotated; with the phone on its
+  left edge they come out upside down, which is what libcamera's
+  counter-clockwise `rotation = <90>` predicts. omacam turns all four
+  cameras 270 clockwise and shows the scene upright: the DT is right, no
+  change. All three back cameras read out the same way up.
+- **omacam** had no hotdog lens table and took the IMX481 as main. A table
+  (main IMX586 1x 1992x1500/3992x3000, ultrawide 0.5x 4648x3496, tele 3x
+  2096x1184/4200x3120, front) is in the owner's
+  `~/.config/omacam/lenses.toml` for now; it belongs in omacam.
+- **Tuning on the phone:** the stock-derived files plus `Af` (coarse 8,
+  fine 32 main / 16 wide and tele) in `/etc/libcamera/ipa/simple/` (private,
+  never committed). AF moved the main lens to 814 and the wide to 404 in a
+  scripted omacam run. The owner: "camera works and looks good", but very
+  noisy, about 10 fps preview, slow focus: all three are the CPU debayer
+  (no denoise or sharpening, slow, and AF steps once per frame).
+- **s5k3m5 crop (upstream bug):** `get_selection()` gave the output size,
+  height = width (4208x4208), so libcamera put the tele's AF window off
+  centre. Fixed: the per-mode analogue crop from the mode registers, plus
+  CROP_DEFAULT and NATIVE_SIZE (`eaa88b840`, W=1 clean as a module).
+- **C9, the GPU debayer's zero frames: `CONFIG_DMABUF_DEBUG=y`.** A
+  standalone EGL test (render magenta into a dmabuf, read it back) works on
+  a GBM buffer and fails on every *imported* one (dma-heap `system`,
+  `reserved`, `default_cma_region`): the CPU's prefill survives, the GPU's
+  own `glReadPixels` reads 0, and each close warns 35 times in
+  `__arm_lpae_unmap` (nothing was mapped). DMABUF_DEBUG (default y under
+  DEBUG_KERNEL) scrambles the page links of an importer's sg table, and msm
+  maps an import's pages from it (upstream "drm/msm: DMABUF_DEBUG fixes",
+  not merged). Off in `kernel-camera.config`. The GPU path ran 13-20 fps
+  even writing nothing. Built: `7.3.0-rc6-omamobile-push1-geaa88b840c8e`
+  (sha256 `b0d3feb3…`), modules pushed.
+- **Its first RAM boot (17:55, from button fastboot, `console=null`) was a
+  bad boot, like the two of 11-05:** the panel showed noise (DPU `frame done
+  timeout`, `ctl 1 reset failure`, `vblank wait timed out` every ~1.5 s),
+  everything ran late from the start (ufshcd re-probed at 22 s, `scsi host0`
+  at 38 s, the partitions at 76 s, the storage guard at 170 s), then
+  `ufshcd-qcom: pwr ctrl cmd 0x17 ... completion timeout` (hibern8 enter) at
+  122 s and every read after it failed at once (`hostbyte=0x07`, the UFS IRQ
+  count frozen at 392): `EXT4-fs (sda22): unable to read superblock`, `arch:
+  cannot mount /dev/sda22`. The initramfs SSH answered. Nothing was mounted,
+  so nothing was written. So the 11-05 hangs were most likely this (UFS and
+  DPU both failing on some RAM boots), not the console. Unknown: why some
+  RAM boots go bad (shared RPMh/interconnect votes? the time spent in
+  fastboot?).
+- **Second RAM boot of `geaa88b840c8e` (18:22): clean** (Arch at 9 s, no
+  DPU, UIC or I/O errors). The EGL test now writes into imported dma-heap
+  buffers (`system` and `gbm` both magenta, no unmap warnings): C9 fixed.
+  `LIBCAMERA_SOFTISP_MODE=gpu cam -c 2` gives real frames (mean 99) at the
+  sensor's rate. `/etc/libcamera/configuration.yaml` on the phone set to
+  `gpu`; device-hotdog's copy changed to `gpu` (it needs the kernel option
+  off). The tuning files on the phone gained the Pixel's `Detail` block
+  (sharpen 0.6, denoise 0.015, chroma 0.03) as a start. omacam: main
+  preview **62 fps** (was about 10 on the CPU), AF sharp on text at 1x; at
+  3x it keeps the main camera ("Low light: main camera"); the ultrawide is
+  grainy at its indoor gain. The laptop needed a NetworkManager profile
+  (`omamobile-phone`, 172.16.42.2/24) after a reboot: without it the
+  address went at each USB re-enumeration.
 
 **C-PHY branch:** `omamobile-hotdog-cphy` rebased onto the final camera
 branch and built (`7.3.0-rc6-omamobile-push1-g8ff34aa9e03b`):
