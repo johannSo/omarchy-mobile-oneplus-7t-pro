@@ -1,8 +1,9 @@
 # OnePlus 7T Pro cameras: what is left
 
-Status 2026-11-13. All four sensors stream; the main IMX586 over C-PHY, the
-three back cameras focus (SEMCO module: LC898217XC at 0x72/0x74, AK7374 at
-0x0c), and libcamera's software ISP runs on the GPU at about 60 fps once
+Status 2026-11-13 (`boot_a` = `g8da458f2d9a9`, cameras load at boot). All
+four sensors stream; the main IMX586 over C-PHY, the three back cameras
+focus (SEMCO module: LC898217XC at 0x72/0x74, AK7374 at 0x0c), and
+libcamera's software ISP runs on the GPU at about 60 fps once
 `CONFIG_DMABUF_DEBUG` is off. The history and the evidence are in
 [CAMERA-PLAN.md](CAMERA-PLAN.md) §7. This file lists the open work, each
 item with what is known, what to do and how to tell it is done.
