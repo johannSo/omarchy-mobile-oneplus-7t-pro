@@ -143,14 +143,15 @@ index 0000000..3f9e597
 +...
 diff --git a/src/ipa/simple/data/imx481.yaml b/src/ipa/simple/data/imx481.yaml
 new file mode 100644
-index 0000000..f54bcfe
+index 0000000..cb227a7
 --- /dev/null
 +++ b/src/ipa/simple/data/imx481.yaml
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,37 @@
 +# SPDX-License-Identifier: CC0-1.0
 +#
 +# Sony IMX481 (the OnePlus 7T Pro's ultrawide), not calibrated yet. The black level comes from the sensor's helper.
-+# Its lens actuator has no kernel driver yet: no Af.
++# Autofocus drives the AK7374 lens: 8 coarse steps, then steps of 1/16
++# of the range.
 +#
 +# The colour matrix is the identity until a calibration, so the saturation
 +# default applies.
@@ -170,18 +171,31 @@ index 0000000..f54bcfe
 +  - Adjust:
 +      contrast: 1.2
 +      saturation: 1.1
++  # Luma and chroma noise reduction and sharpening, scaled with the gain:
++  # measured on our own frames at gain 16 (indoors, the sensor's
++  # limit): about a fifth less luma and a sixth less colour noise than the
++  # Pixel's values, and stronger settings only hit the caps.
++  - Detail:
++      sharpen: 0.5
++      denoise: 0.03
++      chromaDenoise: 0.08
 +  - Agc:
++  - Af:
++      coarseSteps: 8
++      fineSteps: 16
 +...
 diff --git a/src/ipa/simple/data/imx586.yaml b/src/ipa/simple/data/imx586.yaml
 new file mode 100644
-index 0000000..4eebbfc
+index 0000000..15f118a
 --- /dev/null
 +++ b/src/ipa/simple/data/imx586.yaml
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,36 @@
 +# SPDX-License-Identifier: CC0-1.0
 +#
 +# Sony IMX586 (the OnePlus 7T Pro's main camera), not calibrated yet. The black level comes from the sensor's helper.
-+# Its lens actuator has no kernel driver yet: no Af.
++# Autofocus drives the main lens (an LC898217XC on our phone's SEMCO
++# module): 8 coarse steps over the range, then steps of 1/32 of it around
++# the sharpest one, for the large sensor's shallow depth of field.
 +#
 +# The colour matrix is the identity until a calibration, so the saturation
 +# default applies.
@@ -201,7 +215,16 @@ index 0000000..4eebbfc
 +  - Adjust:
 +      contrast: 1.2
 +      saturation: 1.1
++  # Luma and chroma noise reduction and sharpening, scaled with the gain:
++  # the Pixel 7 Pro main camera's values.
++  - Detail:
++      sharpen: 0.6
++      denoise: 0.015
++      chromaDenoise: 0.03
 +  - Agc:
++  - Af:
++      coarseSteps: 8
++      fineSteps: 32
 +...
 diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
 index eaef79f..7717d23 100644
@@ -221,14 +244,15 @@ index eaef79f..7717d23 100644
      's5kgn8.yaml',
 diff --git a/src/ipa/simple/data/s5k3m5.yaml b/src/ipa/simple/data/s5k3m5.yaml
 new file mode 100644
-index 0000000..bf5ff05
+index 0000000..78db0cc
 --- /dev/null
 +++ b/src/ipa/simple/data/s5k3m5.yaml
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,35 @@
 +# SPDX-License-Identifier: CC0-1.0
 +#
 +# Samsung S5K3M5 (the OnePlus 7T Pro's telephoto), not calibrated yet. The black level comes from the sensor's helper.
-+# Its lens actuator has no kernel driver yet: no Af.
++# Autofocus drives the LC898217XC lens: 8 coarse steps, then steps of
++# 1/16 of the range.
 +#
 +# The colour matrix is the identity until a calibration, so the saturation
 +# default applies.
@@ -248,7 +272,16 @@ index 0000000..bf5ff05
 +  - Adjust:
 +      contrast: 1.2
 +      saturation: 1.1
++  # Luma and chroma noise reduction and sharpening, scaled with the gain:
++  # the ultrawide's values (both are small-pixel sensors).
++  - Detail:
++      sharpen: 0.5
++      denoise: 0.03
++      chromaDenoise: 0.08
 +  - Agc:
++  - Af:
++      coarseSteps: 8
++      fineSteps: 16
 +...
 diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
 index a2502a2..3ce9b8a 100644
