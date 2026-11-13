@@ -1,18 +1,19 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Camera plan (hotdog / SM8150): four cameras, the pop-up and the torch
 
-**Status (2026-11-05): theoretical. Written and build-checked on the laptop;
-nothing has run on the phone, and nothing may until the owner approves each
-step below.** Kernel branch `omamobile-hotdog-camera` (worktree
-`~/omamobile-kernel/wt-hotdog-camera`, output
-`~/omamobile-kernel/out-hotdog-camera`) on top of `omamobile-hotdog-fingerprint`
-@ `41a6c1235` (the kernel `boot_a` came from). The main camera's C-PHY
-support is on `omamobile-hotdog-cphy` (worktree `wt-hotdog-cphy`) on top of
-it. Overlays [`torch`](overlays/torch.dtso), [`camera`](overlays/camera.dtso),
-[`camera-main`](overlays/camera-main.dtso), [`popup`](overlays/popup.dtso).
-Pop-up tool in `packages/omamobile-device-hotdog` 0.1.5; sensor helpers in
-`packages/libcamera` 0.7.2-4.23; tables tool
-[`tools/hotdog-camera-tables`](../../tools/hotdog-camera-tables).
+**Status (2026-11-13): torch, all four sensors, focus and the GPU ISP work;
+`boot_a` carries them** (`7.3.0-rc6-omamobile-push1-g8da458f2d9a9`, §7). The
+pop-up has not moved yet (P3-P5). The open work is in
+[CAMERA-NEXT.md](CAMERA-NEXT.md). The kernel is the local branch
+`omamobile-hotdog-int` (worktree `~/omamobile-kernel/wt-hotdog-int`, output
+`~/omamobile-kernel/out-hotdog-int`): `omamobile-hotdog-af` (camera, C-PHY,
+focus actuators, s5k3m5 crop) plus the mic commits. It is not pushed and has
+no Signed-off-by yet. Overlays [`torch`](overlays/torch.dtso),
+[`camera`](overlays/camera.dtso), [`camera-main`](overlays/camera-main.dtso),
+[`camera-af`](overlays/camera-af.dtso), [`popup`](overlays/popup.dtso).
+Pop-up tool and libcamera configuration in `packages/omamobile-device-hotdog`
+0.1.6; sensor helpers and tuning in `packages/libcamera` 0.7.2-4.24; tables
+tool [`tools/hotdog-camera-tables`](../../tools/hotdog-camera-tables).
 
 **Goal.** The rear flash works as the shell's torch; the three rear cameras
 and the front camera stream through libcamera (simple pipeline, software
@@ -670,6 +671,31 @@ system `running` at 4 min. C7 and the focus test pass.**
   grainy at its indoor gain. The laptop needed a NetworkManager profile
   (`omamobile-phone`, 172.16.42.2/24) after a reboot: without it the
   address went at each USB re-enumeration.
+
+**2026-11-13, the cameras made permanent: `boot_a` =
+`7.3.0-rc6-omamobile-push1-g8da458f2d9a9`.**
+
+- **The image:** `omamobile-hotdog-int` = `omamobile-hotdog-af` (with the
+  s5k3m5 crop fix) plus the three mic commits. Built with
+  `kernel-camera.config`, so `DMABUF_DEBUG` is off. Its overlays are
+  `mic torch camera popup camera-main camera-af`. The cmdline is
+  `clk_ignore_unused pd_ignore_unused panic=10 console=tty0`, with no debug
+  shell. sha256 `91d92b34…`. The DTB was checked: the camera, lens,
+  fingerprint, qseecom-compat, SLIMbus and slimcap nodes are all `okay`.
+- **RAM boot (22:14, from button fastboot, `slot-retry-count:a` 2):
+  clean.** There were no DPU, UIC or I/O errors and no `WARNING`. `cam -l`
+  lists all four cameras, and the modules loaded at boot without the
+  bring-up blacklist (device-hotdog 0.1.6). The main, ultrawide and
+  telephoto cameras each delivered 30 frames. The fingerprint service and
+  `fprintd` were active. The sound card and SLIMbus were up, and a 4 s
+  `pw-record` gave live audio (RMS 27, peak 277, in a quiet room).
+- **Flash (22:20):** before it, the old `boot_a` (the mic kernel
+  `gb743280ab222`) was read back from `sde11` to the laptop and its sha256
+  matched the partition; it is the rollback. Then `fastboot -s <serial>
+  flash boot_a`. Slot A's tries went from 2 to 7 and `slot-successful:a`
+  stayed `no`. `fastboot reboot` booted it: the release above, system
+  `running`, four cameras, fingerprint and the sound card. Its first
+  51 630 080 bytes of `sde11` match the image's sha256.
 
 **C-PHY branch:** `omamobile-hotdog-cphy` rebased onto the final camera
 branch and built (`7.3.0-rc6-omamobile-push1-g8ff34aa9e03b`):
