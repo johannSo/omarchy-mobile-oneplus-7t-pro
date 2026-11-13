@@ -184,8 +184,9 @@
 #    uncalibrated tuning file (it ran with no helper before).
 #  - 0057-libcamera-Add-the-OnePlus-7T-Pro-s-camera-sensors.patch: the OnePlus
 #    7T Pro's IMX586, IMX481, IMX471 and S5K3M5: black level 64, their
-#    gains, unit cells and uncalibrated tuning files (device/hotdog/CAMERA-PLAN.md).
-#  - pkgrel 4.23, so it sorts above Arch Linux ARM's 0.7.2-4.
+#    gains, unit cells and uncalibrated tuning files with autofocus and
+#    noise reduction (device/hotdog/CAMERA-PLAN.md).
+#  - pkgrel 4.24, so it sorts above Arch Linux ARM's 0.7.2-4.
 #
 # Maintainers of the original: David Runge, Carl Smedstad.
 
@@ -198,7 +199,7 @@ pkgname=(
   python-libcamera
 )
 pkgver=0.7.2
-pkgrel=4.23
+pkgrel=4.24
 pkgdesc="A complex camera support library for Linux, Android, and ChromeOS (Omarchy Mobile: gs201 CSIS)"
 arch=(aarch64)
 url="https://libcamera.org/"
@@ -406,7 +407,7 @@ b2sums=('1dbd3f78f8d9a2484331798b18b871d7585b5928988e91d586366049d85e3f126e7cfc5
         '63c4bc9556ee28ea34f246ebe2c87a59f5dd50e56218ed5a9e2bb95af16d06672561b0981e3e0475cd885a7b7b8c4112cf203710e7e126cbf9de62e28b6a567f'
         'd58a82be4991c6b4d46be10d0c2c21e7c4a5898c0f997bf64bc2b21702c5071e8e04020faf1389e7091b2f9060a71f41f3f15d8d7b491a167fef650588ecf889'
         '82d09fef3abf67f5c3c6905d056faba7ba6b20edc3d9f6aa887d50c4372a2af770517e8974a53c3fd460fd0eec045804a3cf64191cfe966ec7fc11d23a61426a'
-        '2dc89f45e0a4b3ef21250e88f4d7f234daf7e89b32537b7ccf3e41eed402e29879abe16cb3c06086f9d5be3fef36ae0032f8bd441789e810574677a3042d60be')
+        'da37fea1dc8ee8f1d6d38f37e88699703ffa596989689b15ae5c610209bc3b0e04007a6d5656dde6f6d6eb650d1926085d31ad415815f7e0fd07ec4ca23276f2')
 
 _pick() {
   local p="$1" f d; shift
