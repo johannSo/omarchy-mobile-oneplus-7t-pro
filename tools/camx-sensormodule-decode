@@ -5,8 +5,8 @@
 Reads com.qti.sensormodule.<module>_<sensor>.bin (from the owner's own
 vendor image) and prints JSON: the module configuration (camera slot,
 names, lanes, lens), the sensor's I2C identity, power sequences, the
-exposure/gain register map and every register table (init, stream on/off,
-group hold, per resolution mode, ...).
+exposure/gain register map, every register table (init, stream on/off,
+group hold, per resolution mode, ...) and the focus actuator's settings.
 
 Standalone, Python 3 standard library only. Run it with `python3 -I`.
 It never writes anything except to stdout (or --out). The decoded tables are
@@ -66,6 +66,14 @@ the data (sensor ID 0x586/0x471/0x30d5 at 0x0016/0x0000, 0x34c/0x34e/0x340/
 clock). Fields marked with a "?" in their name are best guesses.
 Enumerations follow the kernel's cam_sensor headers (power sequence types,
 I2C frequency modes, I2C address/data types).
+
+Actuator (actuatorDriver): name, 8-bit slave address, I2C mode, type,
+DAC width, power sequences, the position register (registerParam: address
+and data types, register, operation, hwMask, hwShift, delayUs?, dataShift),
+init/deinit register tables (same rows as the sensor's), initial code, the
+step region (macro/infinity step boundaries, codes per step) and the two
+ringing scenarios. Labels with "?" are guesses; dataShift is the last slot
+(6 for the 10-bit AK7374, 0 for the LC898217XC).
 
 Gain formulas: the files carry realToRegGain/regToRealGain as empty strings;
 the conversion lives in com.qti.sensor.<sensor>.so. GAIN_HINTS below holds
@@ -579,7 +587,63 @@ def rd_camera_module(cur, ctx):
     return r
 
 
-READERS = {"cameraModuleData": rd_camera_module, "sensorDriverData": rd_sensor_driver}
+ACT_TYPE = {0: "VCM?"}
+ACT_OPERATION = {1: "WRITE_DAC?"}
+
+
+def rd_act_regparam(cur, ctx):
+    r = read_struct(cur, [("regAddrType", "u"), ("regDataType", "u"), ("registerAddr", "u"),
+                          ("registerData", "u"), ("operation", "u"), ("hwMask", "u"),
+                          ("hwShift", "u"), ("delayUs?", "u"), ("dataShift", "u")], ctx)
+    r["operationName"] = ACT_OPERATION.get(r["operation"])
+    return r
+
+
+def rd_act_region(cur, ctx):
+    return {"macroStepBoundary": cur.scalar("macroStepBoundary"),
+            "infinityStepBoundary": cur.scalar("infinityStepBoundary"),
+            "codePerStep": round(as_float(cur.scalar("codePerStep")), 7),
+            "qFactor?": cur.scalar("qFactor")}
+
+
+def rd_act_damping(cur, ctx):
+    v = [cur.scalar("damping") for _ in range(3)]
+    return {"dampingStep?": v[0], "dampingDelayUs?": v[1],
+            "hwParams?": v[2] - (1 << 16) if v[2] & 0x8000 else v[2]}
+
+
+def rd_act_scenario(cur, ctx):
+    return read_struct(cur, [("region", "array", ("region", rd_act_damping))], ctx)
+
+
+def rd_actuator(cur, ctx):
+    """actuatorDriver. Field names follow CAMX actuator XML conventions; the
+    order of the last registerParam fields (delayUs?, dataShift) is inferred
+    from the AK73xx family's MSB-aligned positions (shift 6 for 10 bits)."""
+    a = {"moduleVersion": [cur.scalar("major"), cur.scalar("minor"), cur.scalar("incr")]}
+    a.update(read_struct(cur, [
+        ("actuatorName", "str"), ("slaveAddress8bit", "u"), ("i2cFrequencyMode", "u"),
+        ("actuatorType", "u"), ("dataBitWidth", "u"),
+        ("powerUpSequence", "array", ("powerSetting", rd_power)),
+        ("powerDownSequence", "array", ("powerSetting", rd_power)),
+        ("registerParam", "array", ("registerParam", rd_act_regparam)),
+    ], ctx))
+    a["slaveAddress7bit"] = a["slaveAddress8bit"] >> 1
+    a["i2cFrequencyModeName"] = I2C_FREQ.get(a["i2cFrequencyMode"])
+    a["actuatorTypeName"] = ACT_TYPE.get(a["actuatorType"])
+    a["initSettings"] = rd_regs(cur, ctx)
+    a["deInitSettings"] = rd_regs(cur, ctx, "deInitSettings")
+    a["initialCode"] = cur.scalar("initialCode")
+    a.update(read_struct(cur, [("region", "array", ("region", rd_act_region))], ctx))
+    for n in ("forward", "backward"):
+        a[n + "Scenario?"] = {"stepBoundary?": cur.scalar(n)}
+        a[n + "Scenario?"].update(read_struct(cur, [("scenario", "array",
+                                                     ("scenario", rd_act_scenario))], ctx))
+    return a
+
+
+READERS = {"cameraModuleData": rd_camera_module, "sensorDriverData": rd_sensor_driver,
+           "actuatorDriver": rd_actuator}
 
 
 def decode(path, want_generic=False, hexfmt=False):
@@ -622,6 +686,17 @@ def summarize(o):
                   "isComboMode": mc.get("isComboMode"), "eeprom": mc.get("eepromName"),
                   "actuator": mc.get("actuatorName"), "ois": mc.get("oisName"),
                   "flash": mc.get("flashName")})
+    act = o.get("actuatorDriver", {})
+    if "actuatorName" in act:
+        rp = act["registerParam"][0] if act["registerParam"] else {}
+        s["actuatorDriver"] = {
+            "name": act["actuatorName"], "slaveAddress7bit": "0x%02x" % act["slaveAddress7bit"],
+            "i2cFrequency": act["i2cFrequencyModeName"], "dataBitWidth": act["dataBitWidth"],
+            "position": "reg 0x%02x, %s, value << %s" % (
+                rp.get("registerAddr", 0), I2C_TYPE.get(rp.get("regDataType")),
+                rp.get("dataShift")) if rp else None,
+            "init": len(act["initSettings"]), "deInit": len(act["deInitSettings"]),
+            "initialCode": act["initialCode"]}
     if "slaveInfo" in sd:
         si, ra = sd["slaveInfo"], sd["regAddrInfo"]
         s.update({
@@ -669,7 +744,8 @@ def hexify(o):
     """--hex: register tables as hex strings."""
     if isinstance(o, dict):
         for k, v in o.items():
-            if k in ("regSetting", "streamOnSettings", "streamOffSettings",
+            if k in ("regSetting", "streamOnSettings", "streamOffSettings", "initSettings",
+                     "deInitSettings",
                      "groupHoldOnSettings", "groupHoldOffSettings") and isinstance(v, list):
                 o[k] = [hexreg(r) for r in v]
             else:
@@ -696,7 +772,7 @@ def main():
     ap.add_argument("files", nargs="+")
     ap.add_argument("--hex", action="store_true", help="register tables as hex strings")
     ap.add_argument("--generic", action="store_true",
-                    help="also dump the other blocks (PDAF, actuator, EEPROM, flash, OIS) "
+                    help="also dump the other blocks (PDAF, EEPROM, flash, OIS) "
                          "as a generic tree")
     ap.add_argument("--summary", action="store_true", help="print only the summaries")
     ap.add_argument("--out", help="write JSON here instead of stdout")
