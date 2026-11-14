@@ -21,11 +21,11 @@ done < <(find vendor -type l -print0)
 while IFS= read -r -d '' file; do
   install -Dm644 "$file" "$destination/usr/share/alsa/${file}"
 done < <(find ucm2 -type f -print0)
-# The modem stays off the network: ModemManager would turn the radio on, and
-# on this phone that crashed the modem into a SoC crash dump (owner's rule:
-# the radio goes on only with the owner's explicit yes)
+# ModemManager is no longer masked (device/hotdog/MODEM-PLAN.md R2): the
+# radio came on cleanly on 2026-11-14 with the RF cable state set by the
+# kernel's project-info driver. It starts from a vendor wants link, after
+# rmtfs and tqftpserv (its drop-in).
 install -d "$destination/etc/systemd/system"
-ln -sfn /dev/null "$destination/etc/systemd/system/ModemManager.service"
 # systemd-firstboot prompts for locale, keymap, timezone and root password on
 # the console, which is the panel here (console=tty0) and has no keyboard;
 # it runs before sysinit.target, so it held sshd and omamobile-firstboot
