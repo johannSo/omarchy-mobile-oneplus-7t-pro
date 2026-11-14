@@ -5,9 +5,45 @@
 # the phone needs.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-for f in build install bin/* lib/omamobile-fp-hotdog-chroot; do bash -n "$f"; done
+for f in build install bin/* lib/omamobile-fp-hotdog-chroot libexec/omamobile-hotdog-sim-select; do bash -n "$f"; done
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' libexec/omamobile-hotdog-call-audio
 echo "ok - scripts parse"
-for f in libexec/*; do
+python3 -B test/call-audio.py
+echo "ok - call audio routes and restores"
+# The SIM selection against a recorded card status (no ICCID in it): it
+# activates slot 1's USIM, and does nothing when a session exists
+fake=$(mktemp -d)
+cat > "$fake/qmicli" <<'Q'
+#!/bin/bash
+case "$*" in
+  *--uim-get-card-status*) cat "$FAKE_STATUS" ;;
+  *--uim-change-provisioning-session=*) echo "$*" >> "$FAKE_LOG" ;;
+esac
+Q
+printf '#!/bin/sh\n' > "$fake/mmcli"; printf '#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n' > "$fake/systemctl"
+chmod +x "$fake"/*
+cat > "$fake/status" <<'S'
+Provisioning applications:
+	Primary GW:   session doesn't exist
+Slot [1]:
+	Card state: 'present'
+	Application [1]:
+		Application type:  'usim (2)'
+		Application state: 'detected'
+		Application ID:
+			A0:00:00:00:87:10:02:FF:FF:FF:FF:89:00:00:00:00
+Slot [2]:
+	Card state: 'error: no-atr-received (3)'
+S
+PATH=$fake:$PATH FAKE_STATUS=$fake/status FAKE_LOG=$fake/log libexec/omamobile-hotdog-sim-select --once >/dev/null
+grep -c "slot=1,activate=yes,session-type=primary-gw-provisioning,aid=A0:00:00:00:87:10:02:FF:FF:FF:FF:89:00:00:00:00" "$fake/log" >/dev/null ||
+  { echo "not ok - SIM selection"; exit 1; }
+sed -i "s/session doesn't exist/slot '1', application '1'/" "$fake/status"; : > "$fake/log"
+PATH=$fake:$PATH FAKE_STATUS=$fake/status FAKE_LOG=$fake/log libexec/omamobile-hotdog-sim-select --once >/dev/null
+[[ ! -s $fake/log ]] || { echo "not ok - SIM selection with a session"; exit 1; }
+rm -rf "$fake"
+echo "ok - SIM selection"
+for f in libexec/omamobile-hotdog-popup libexec/omamobile-hotdog-call-audio; do
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"
 done
 grep -c "ALLOWED_HALL_WRITES = {0x00, 0x01, 0x07, 0x08}" libexec/omamobile-hotdog-popup >/dev/null ||
@@ -15,17 +51,29 @@ grep -c "ALLOWED_HALL_WRITES = {0x00, 0x01, 0x07, 0x08}" libexec/omamobile-hotdo
 [[ ! -e vendor/systemd/system/multi-user.target.wants/omamobile-hotdog-popup.service ]] ||
   { echo "not ok - the pop-up service must not be enabled by the package"; exit 1; }
 echo "ok - pop-up tool parses, stays off by default"
-for l in vendor/systemd/system/*.wants/*; do
-  [[ -f vendor/systemd/system/$(basename "$(readlink "$l")") ]] || { echo "not ok - $l has no unit"; exit 1; }
+for l in vendor/systemd/system/*.wants/* vendor/systemd/user/*.wants/*; do
+  u=$(basename "$(readlink "$l")")
+  # ModemManager.service and mmsd-tng.service come from their packages (depends)
+  [[ -f $(dirname "$(dirname "$l")")/$u || $u == ModemManager.service || $u == mmsd-tng.service ]] ||
+    { echo "not ok - $l has no unit"; exit 1; }
 done
+grep -c "^depends=(.* modemmanager[ )]" PKGBUILD >/dev/null || { echo "not ok - ModemManager's wants link without the package"; exit 1; }
+grep -c "^depends=(.* mmsd-tng[ )]" PKGBUILD >/dev/null || { echo "not ok - mmsd-tng's wants link without the package"; exit 1; }
 echo "ok - wants links"
 grep -cx 'ExecStart=/usr/lib/omamobile/hotdog/rmtfs -r -P -s' vendor/systemd/system/omamobile-rmtfs.service >/dev/null ||
   { echo "not ok - rmtfs must run read-only (-r)"; exit 1; }
 echo "ok - rmtfs read-only"
 for p in modemst1 modemst2 fsg fsc oem_stanvbk oem_dycnvbk persist; do
-  grep -c "|$p|\|\"$p|\||$p\"" vendor/udev/rules.d/10-omamobile-storage.rules >/dev/null ||
-    { echo "not ok - $p is not set read-only by udev"; exit 1; }
+  for key in ID_PART_ENTRY_NAME PARTNAME; do
+    grep "ENV{$key}==" vendor/udev/rules.d/10-omamobile-storage.rules | grep -- "--setro" |
+      grep -c "\"$p|\||$p|\||$p\"" >/dev/null ||
+      { echo "not ok - $p is not set read-only by udev ($key)"; exit 1; }
+  done
 done
+# The by-partlabel names udev cannot give sda's partitions: only rmtfs's two
+grep 'SYMLINK' vendor/udev/rules.d/10-omamobile-storage.rules |
+  grep -cx '.*ENV{PARTNAME}=="oem_stanvbk|oem_dycnvbk", SYMLINK+="disk/by-partlabel/$env{PARTNAME}"' >/dev/null ||
+  { echo "not ok - partlabel links beyond oem_stanvbk and oem_dycnvbk"; exit 1; }
 echo "ok - NV partitions read-only"
 # The microphones need the mic overlay and the codec's modules. Without
 # them the speakers' verb must still load, so every codec control the UCM
@@ -51,8 +99,17 @@ for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/b
     usr/lib/udev/rules.d/70-omamobile-dma-heap.rules usr/share/libcamera/configuration.yaml; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
-[[ $(readlink "$stage/etc/systemd/system/ModemManager.service") == /dev/null ]] || { echo "not ok - ModemManager not masked"; exit 1; }
+[[ ! -e $stage/etc/systemd/system/ModemManager.service && ! -L $stage/etc/systemd/system/ModemManager.service ]] ||
+  { echo "not ok - ModemManager is masked"; exit 1; }
+[[ $(readlink "$stage/usr/lib/systemd/system/multi-user.target.wants/ModemManager.service") == ../ModemManager.service ]] ||
+  { echo "not ok - ModemManager not started at boot"; exit 1; }
+grep -cx 'After=omamobile-rmtfs.service omamobile-tqftpserv.service' \
+    "$stage/usr/lib/systemd/system/ModemManager.service.d/omamobile-hotdog.conf" >/dev/null ||
+  { echo "not ok - ModemManager does not wait for rmtfs"; exit 1; }
 [[ $(readlink "$stage/etc/systemd/system/systemd-firstboot.service") == /dev/null ]] || { echo "not ok - systemd-firstboot not masked"; exit 1; }
+[[ -x $stage/usr/lib/omamobile/hotdog/omamobile-hotdog-call-audio && \
+   $(readlink "$stage/usr/lib/systemd/user/default.target.wants/omamobile-hotdog-call-audio.service") == ../omamobile-hotdog-call-audio.service ]] ||
+  { echo "not ok - call audio service"; exit 1; }
 echo "ok - staged install"
 # The cameras: the CPU debayer (the GPU one gives zero frames on this GPU),
 # and the user's session may allocate the ISP's buffers
