@@ -433,8 +433,12 @@ for dir in "${build[@]}"; do
       # built yet are left out: makepkg runs with --nodeps.
       wanted=$(awk "\$1 ~ /^(depends|makedepends|checkdepends)\$/ {print \$3}" <<<"$info" | sed "s/[<>=].*//" | sort -u)
       install=()
+      # -dd: only whether a repository has it (a name like cargo is a
+      # provision of rust). Without it, an image behind the repositories
+      # failed the dependency check and the package was left out silently,
+      # so rust never went in (2026-11-14, openssl 4).
       for dep in $wanted; do
-        pacman -Sp --print-format %n "$dep" >/dev/null 2>&1 && install+=("$dep")
+        pacman -Sp -dd --print-format %n "$dep" >/dev/null 2>&1 && install+=("$dep")
       done
       # The build image is made once and kept, so it falls behind the
       # repositories, and installing current packages into it is a partial
