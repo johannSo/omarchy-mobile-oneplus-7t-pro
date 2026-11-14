@@ -68,9 +68,24 @@ EOF
   harden_config
 }
 
+# The first render node's kernel driver: Waydroid binds that one.
+render_driver() {
+  local r
+  for r in /sys/class/drm/renderD*; do
+    [[ -e $r/device/driver ]] || continue
+    basename "$(readlink -f "$r/device/driver")"
+    return
+  done
+}
+
 cmd_mesa() {
   need_root
-  local img
+  local img drv
+  drv=$(render_driver)
+  if [[ $drv != panthor ]]; then
+    echo "omamobile-waydroid: the render node is ${drv:-missing}, not panthor: the vendor Mesa needs no patch"
+    return 0
+  fi
   for img in "$WORK/images/vendor.img" /usr/share/waydroid-extra/images/vendor.img /etc/waydroid-extra/images/vendor.img; do
     [[ -f $img ]] && break
   done
