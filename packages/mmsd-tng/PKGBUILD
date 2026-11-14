@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT
+# mmsd-tng: the MMS daemon behind Messages on phones with ModemManager
+# (docs/TELEPHONY-APPS-PLAN.md §1.7, T3). It takes the WAP push SMS that
+# announces an MMS from ModemManager, fetches the message from the carrier's
+# MMSC over the mobile data connection, sends MMS the same way, and serves
+# org.ofono.mms on the session bus, which omatel-agent uses. Not in Arch
+# Linux ARM's repositories (AUR only), so we build it.
+#
+# Source: upstream's git at the 2.6.4 release plus two fixes after it, pinned
+# by commit. The user unit starts it in every graphical session; device
+# packages whose modem is ModemManager's turn it on (a default.target wants
+# link), so phones without that modem stack don't run it.
+pkgname=mmsd-tng
+pkgver=2.6.4.r2.g3411171
+pkgrel=1
+pkgdesc="Multimedia Messaging Service daemon for ModemManager"
+arch=(aarch64)
+url="https://gitlab.com/kop316/mmsd"
+license=('GPL-2.0-only')
+depends=(c-ares gcc-libs glib2 glibc libmm-glib libphonenumber libsoup3 mobile-broadband-provider-info)
+makedepends=(git meson)
+provides=(mmsd)
+conflicts=(mmsd mmsd-tng-git)
+source=("mmsd::git+https://gitlab.com/kop316/mmsd.git#commit=341117141f8d30949fb1294cc71ee44af9b4c90f"
+        mmsd-tng.service)
+sha256sums=('SKIP'
+            'ffc7a1942f109941223c66133eaed67f61466ef154fcd94b1688a013a4ed3ebf')
+
+build() {
+  arch-meson mmsd build
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 mmsd-tng.service "$pkgdir/usr/lib/systemd/user/mmsd-tng.service"
+}
