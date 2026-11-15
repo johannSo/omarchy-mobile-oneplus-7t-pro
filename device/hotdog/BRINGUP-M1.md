@@ -213,6 +213,24 @@ sha256, `systemctl --failed` empty. Open, the owner's decision: how slot A
 gets marked again (a GPT write: `fastboot --set-active=a` in ABL or a
 mark-successful from Linux), before the tries run low. Keep reboots few.
 
+**2026-11-15: slot A marked successful again, from Linux, with the owner's
+yes.** `boot_a` had been flashed with `7.3.0-rc6-omamobile-push1-gce58cc9c3759`
+and booted once (tries 6). `device/hotdog/slot-a-mark`: `status` and `dump`
+(read-only) first; the dump went off the phone to
+`~/android/reference/hotdog/gpt/sde-before-slot-a-mark-2026-11-15.tar`
+(sha256 of the touched bytes `3466da83…`, checked again on the laptop: both
+entry arrays identical, `boot_a` tries 6, successful 0, active). Then
+`write --sha256 3466da83…`: backup copy (LBA 1048575) then primary (LBA 1),
+each written and read back, `sde` read-only again. Before → after:
+`boot_a: priority 3 active 1 tries 6 successful 0 unbootable 0` →
+`… successful 1 …`; `boot_b` unchanged (`priority 0 active 0 tries 0
+successful 0 unbootable 0`); both CRCs valid, copies identical, new sha256
+`361c9ccc…`. Every later `fastboot flash boot_a` clears the bit again
+(H4 above): after the flashed kernel has booted, run `status`, `dump` and
+`write` again with the owner's yes. Rollback for a broken GPT: the dump holds
+both copies' header and entry bytes at their offsets; the phone still boots
+to fastboot by the buttons.
+
 `omarchy update` failed with "Cannot fetch updates": the `local` channel's
 `[omamobile]` database is signed with this port's local key, which the build
 trusted only in its own keyring, so on the phone the key was unknown. Also,

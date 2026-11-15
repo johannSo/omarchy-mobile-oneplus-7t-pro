@@ -37,6 +37,10 @@ install -Dm644 wireplumber/51-omamobile-hotdog-mic.conf \
 # The cameras' software ISP runs on the CPU (CAMERA-PLAN C8)
 install -Dm644 libcamera/configuration.yaml "$destination/usr/share/libcamera/configuration.yaml"
 install -Dm644 etc/omamobile-mirrorlist "$destination/etc/pacman.d/omamobile-mirrorlist"
+# GNSS through the modem's QMI LOC (omamobile-gnss reads the opt-in), and
+# GeoClue's ModemManager GPS source off (it only ever sees $PQ sentences)
+install -Dm644 gnss/qmi-loc.conf "$destination/usr/share/omamobile/gnss/qmi-loc.conf"
+install -Dm644 geoclue/92-omamobile-hotdog.conf "$destination/etc/geoclue/conf.d/92-omamobile-hotdog.conf"
 # Fingerprint (device/hotdog/FINGERPRINT-PLAN.md): the runner, its property
 # file and the bionic programs built on the computer with the NDK
 #   make -C device/hotdog/fingerprint NDK=... OUT=$PWD/packages/omamobile-device-hotdog/prebuilt
