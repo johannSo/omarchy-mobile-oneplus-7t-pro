@@ -5,7 +5,8 @@
 # the phone needs.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-for f in build install bin/* lib/omamobile-fp-hotdog-chroot libexec/omamobile-hotdog-sim-select; do bash -n "$f"; done
+for f in PKGBUILD build install bin/* lib/omamobile-fp-hotdog-chroot libexec/omamobile-hotdog-sim-select \
+    libexec/omamobile-hotdog-modem-recovery libexec/omamobile-hotdog-sleep; do bash -n "$f"; done
 python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' libexec/omamobile-hotdog-call-audio
 echo "ok - scripts parse"
 python3 -B test/call-audio.py
@@ -51,6 +52,31 @@ grep -c "ALLOWED_HALL_WRITES = {0x00, 0x01, 0x07, 0x08}" libexec/omamobile-hotdo
 [[ ! -e vendor/systemd/system/multi-user.target.wants/omamobile-hotdog-popup.service ]] ||
   { echo "not ok - the pop-up service must not be enabled by the package"; exit 1; }
 echo "ok - pop-up tool parses, stays off by default"
+# The alert slider: top Silent, middle Vibrate, bottom Ring (ABS_SND_PROFILE
+# 0, 1, 2) onto feedbackd's profiles; the ioctl reads ABS_SND_PROFILE; udev
+# gives the device to the seat's user before 73-seat-late.
+python3 -B - <<'PY'
+import importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("slider", "libexec/omamobile-hotdog-alert-slider")
+spec = importlib.util.spec_from_loader("slider", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+assert {k: v[0] for k, v in m.POSITIONS.items()} == {0: "silent", 1: "quiet", 2: "full"}, m.POSITIONS
+assert m.EVIOCGABS == 0x80184562, hex(m.EVIOCGABS)
+assert m.EVENT.size == 24
+calls = []
+m.set_profile = calls.append
+m.subprocess.run = lambda argv, **kw: calls.append(argv[0])
+m.apply(1, announce=False); m.apply(0, announce=True); m.apply(7, announce=True)
+assert calls == ["quiet", "silent", "omarchy-osd"], calls
+PY
+grep -c 'ATTRS{name}=="Alert slider", TAG+="uaccess"' vendor/udev/rules.d/72-omamobile-hotdog-keys.rules >/dev/null ||
+  { echo "not ok - the alert slider is not given to the seat's user"; exit 1; }
+grep -cx 'ConditionUser=!@system' vendor/systemd/user/omamobile-hotdog-alert-slider.service >/dev/null ||
+  { echo "not ok - the alert slider must not run in root's user manager too"; exit 1; }
+[[ -L vendor/systemd/user/graphical-session.target.wants/omamobile-hotdog-alert-slider.service ]] &&
+  grep -cx 'PartOf=graphical-session.target' vendor/systemd/user/omamobile-hotdog-alert-slider.service >/dev/null ||
+  { echo "not ok - the alert slider must run for the graphical session (its OSD needs the session's environment)"; exit 1; }
+echo "ok - alert slider sets the feedback profile"
 for l in vendor/systemd/system/*.wants/* vendor/systemd/user/*.wants/*; do
   u=$(basename "$(readlink "$l")")
   # ModemManager.service and mmsd-tng.service come from their packages (depends)
@@ -63,6 +89,25 @@ echo "ok - wants links"
 grep -cx 'ExecStart=/usr/lib/omamobile/hotdog/rmtfs -r -P -s' vendor/systemd/system/omamobile-rmtfs.service >/dev/null ||
   { echo "not ok - rmtfs must run read-only (-r)"; exit 1; }
 echo "ok - rmtfs read-only"
+# Shutdown: rmtfs -s stops the modem on SIGTERM, and that stop sent the SoC
+# to its crash dump with the root file system read-write (MODEM-PLAN R9).
+# The unit ends rmtfs with SIGKILL after turning the modem's recovery off,
+# and turns it on again at start.
+unit=vendor/systemd/system/omamobile-rmtfs.service
+grep -cx 'KillSignal=SIGKILL' $unit >/dev/null || { echo "not ok - rmtfs must not get SIGTERM (it stops the modem)"; exit 1; }
+grep -cx 'ExecStop=-/usr/lib/omamobile/hotdog/omamobile-hotdog-modem-recovery disabled' $unit >/dev/null &&
+  grep -cx 'ExecStartPre=-/usr/lib/omamobile/hotdog/omamobile-hotdog-modem-recovery enabled' $unit >/dev/null ||
+  { echo "not ok - modem recovery is not off while rmtfs is down"; exit 1; }
+sys=$(mktemp -d)
+mkdir -p "$sys/class/remoteproc/remoteproc0" "$sys/class/remoteproc/remoteproc1"
+echo cdsp > "$sys/class/remoteproc/remoteproc0/name"; echo enabled > "$sys/class/remoteproc/remoteproc0/recovery"
+echo modem > "$sys/class/remoteproc/remoteproc1/name"; echo enabled > "$sys/class/remoteproc/remoteproc1/recovery"
+OMAMOBILE_SYSFS=$sys libexec/omamobile-hotdog-modem-recovery disabled >/dev/null
+[[ $(<"$sys/class/remoteproc/remoteproc1/recovery") == disabled && $(<"$sys/class/remoteproc/remoteproc0/recovery") == enabled ]] ||
+  { echo "not ok - modem recovery helper"; exit 1; }
+! OMAMOBILE_SYSFS=$sys libexec/omamobile-hotdog-modem-recovery off 2>/dev/null || { echo "not ok - recovery helper takes only enabled|disabled"; exit 1; }
+rm -rf "$sys"
+echo "ok - rmtfs leaves the modem running at shutdown"
 for p in modemst1 modemst2 fsg fsc oem_stanvbk oem_dycnvbk persist; do
   for key in ID_PART_ENTRY_NAME PARTNAME; do
     grep "ENV{$key}==" vendor/udev/rules.d/10-omamobile-storage.rules | grep -- "--setro" |
@@ -96,6 +141,7 @@ for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/b
     usr/lib/modprobe.d/omamobile-fp-hotdog.conf etc/pam.d/omarchy-lock-fingerprint \
     usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf \
     usr/lib/omamobile/hotdog/omamobile-hotdog-popup usr/lib/systemd/system/omamobile-hotdog-popup.service \
+    usr/lib/omamobile/hotdog/omamobile-hotdog-modem-recovery \
     usr/lib/udev/rules.d/70-omamobile-dma-heap.rules usr/share/libcamera/configuration.yaml; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
@@ -124,3 +170,52 @@ grep -cx 'options qcom_qseecom_compat app_allowlist=gfp9558,keymaster64 .*' vend
 grep -cx 'Restart=no' vendor/systemd/system/omamobile-fp-hotdog.service >/dev/null ||
   { echo "not ok - omamobile-fp-hotdog must not restart"; exit 1; }
 echo "ok - fingerprint"
+# GNSS: the opt-in for omamobile-gnss's QMI LOC path, and its engine unlock
+# only while rmtfs keeps the modem's EFS writes in RAM (-r)
+grep -cx 'ENGINE_UNLOCK=1' gnss/qmi-loc.conf >/dev/null || { echo "not ok - GNSS opt-in"; exit 1; }
+grep -cE '^ExecStart=\S*/rmtfs -r ' vendor/systemd/system/omamobile-rmtfs.service >/dev/null ||
+  { echo "not ok - ENGINE_UNLOCK=1 needs rmtfs -r (the lock is an EFS write)"; exit 1; }
+[[ -f $stage/usr/share/omamobile/gnss/qmi-loc.conf ]] || { echo "not ok - qmi-loc.conf not staged"; exit 1; }
+grep -A1 -x '\[modem-gps\]' "$stage/etc/geoclue/conf.d/92-omamobile-hotdog.conf" | grep -cx 'enable=false' >/dev/null ||
+  { echo "not ok - GeoClue's modem GPS source must be off"; exit 1; }
+grep -c 'etc/geoclue/conf.d/92-omamobile-hotdog.conf' PKGBUILD >/dev/null || { echo "not ok - the GeoClue drop-in is a backup file"; exit 1; }
+echo "ok - GNSS through the modem"
+# Suspend (device/hotdog/SUSPEND-PLAN.md): s2idle only, the sleep hook is
+# linked and executable, ModemManager keeps the modem across sleep, and the
+# hook arms only the modem's QRTR channel for wake (against a fake sysfs)
+grep -cx 'MemorySleepMode=s2idle' "$stage/usr/lib/systemd/sleep.conf.d/10-omamobile.conf" >/dev/null ||
+  { echo "not ok - sleep.conf must name s2idle"; exit 1; }
+hook=$stage/usr/lib/systemd/system-sleep/omamobile-hotdog
+[[ $(readlink "$hook") == /usr/lib/omamobile/hotdog/omamobile-hotdog-sleep && \
+   -x $stage/usr/lib/omamobile/hotdog/omamobile-hotdog-sleep ]] || { echo "not ok - sleep hook"; exit 1; }
+grep -cx 'ExecStart=/usr/bin/ModemManager --test-quick-suspend-resume' \
+    "$stage/usr/lib/systemd/system/ModemManager.service.d/omamobile-hotdog.conf" >/dev/null ||
+  { echo "not ok - ModemManager quick suspend/resume"; exit 1; }
+sys=$(mktemp -d)
+for d in 4080000.remoteproc:glink-edge.IPCRTR.-1.-1 17300000.remoteproc:glink-edge.IPCRTR.-1.-1; do
+  mkdir -p "$sys/$d/power"; echo disabled > "$sys/$d/power/wakeup"; echo 7 > "$sys/$d/power/wakeup_active_count"
+done
+# A fake /sys/class/net (wlan0 up, usb0 up but wired) and ip, never the real ones
+mkdir -p "$sys/net/wlan0/phy80211" "$sys/net/usb0" "$sys/bin"
+echo 0x1003 > "$sys/net/wlan0/flags"; echo 0x1003 > "$sys/net/usb0/flags"
+printf '#!/bin/sh\necho "ip $*" >> "%s/ip.log"\n' "$sys" > "$sys/bin/ip"; chmod +x "$sys/bin/ip"
+sed "s#/sys/bus/rpmsg/devices#$sys#; s#^net=/sys/class/net#net=$sys/net#" libexec/omamobile-hotdog-sleep > "$sys/hook"
+grep -c "^net=$sys/net" "$sys/hook" >/dev/null || { echo "not ok - the hook's net path is not stubbed"; exit 1; }
+export OMAMOBILE_HOTDOG_SLEEP_QUIET_MS=500 OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS=1500
+out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend)
+[[ $out == *"quiet after 500 ms"* ]] || { echo "not ok - sleep hook waits for a quiet modem channel ($out)"; exit 1; }
+[[ $(cat "$sys/ip.log") == "ip link set dev wlan0 down" ]] || { echo "not ok - the hook takes Wi-Fi (only) down before the sleep"; exit 1; }
+rm -rf "$sys/net/wlan0/phy80211"
+# A channel that keeps talking: the hook gives up after the settle time
+( for i in 1 2 3 4 5 6 7 8; do sleep 0.2; echo $((8 + i)) > "$sys/4080000.remoteproc:glink-edge.IPCRTR.-1.-1/power/wakeup_active_count"; done ) &
+out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend); wait
+[[ $out == *"still busy after 1500 ms"* ]] || { echo "not ok - sleep hook bounds its wait ($out)"; exit 1; }
+[[ $(<"$sys/4080000.remoteproc:glink-edge.IPCRTR.-1.-1/power/wakeup") == enabled && \
+   $(<"$sys/17300000.remoteproc:glink-edge.IPCRTR.-1.-1/power/wakeup") == disabled && \
+   $out == *"can wake the phone"* ]] || { echo "not ok - sleep hook arms the modem channel only"; exit 1; }
+rm -rf "$sys/4080000.remoteproc:glink-edge.IPCRTR.-1.-1"
+[[ $(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend) == *"won't wake the phone"* ]] || { echo "not ok - sleep hook without a modem channel"; exit 1; }
+bash "$sys/hook" post suspend >/dev/null
+unset OMAMOBILE_HOTDOG_SLEEP_QUIET_MS OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS
+rm -rf "$sys"
+echo "ok - suspend"

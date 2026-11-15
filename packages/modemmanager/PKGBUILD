@@ -14,7 +14,14 @@
 #    ModemManager run crashed it (SIGSEGV at 0x30 right after "net link
 #    qmapmux0.0 created"): mobile data could be turned on once per boot
 #    (device/hotdog/MODEM-PLAN.md R6). Drop it once a release carries it.
-#  - pkgrel 2.1: Arch's and Arch Linux ARM's 1.24.2-2 plus .1, so it sorts
+#  - cherry-picks upstream 0edcb916 ("base-manager: fix cleanup of
+#    multiplexed bearers", on main, not in 1.24.2 or the mm-1-24 branch). Over
+#    IPA every bearer is multiplexed, so the modem's limit of non-multiplexed
+#    active bearers is 0, and 1.24.2's cleanup counted a connected bearer
+#    against that limit alone: ModemManager aborted (g_assert in
+#    mm_iface_modem_count_bearers) at every stop with mobile data on, at each
+#    shutdown of the OnePlus 7T Pro (device/hotdog/MODEM-PLAN.md R9).
+#  - pkgrel 2.2: Arch's and Arch Linux ARM's 1.24.2-2 plus .2, so it sorts
 #    above both; [omamobile] comes first in pacman.conf.
 #  - the source pinned by commit (1.24.2's) instead of the signed tag, so
 #    the build needs no maintainer keys; no gtk-doc, no modemmanager-docs.
@@ -29,8 +36,8 @@ pkgname=(
   libmm-glib
 )
 pkgver=1.24.2
-pkgrel=2.1
-pkgdesc="Mobile broadband modem management service (Omarchy Mobile: netlink use-after-free fix)"
+pkgrel=2.2
+pkgdesc="Mobile broadband modem management service (Omarchy Mobile: netlink use-after-free and multiplexed cleanup fixes)"
 url="https://www.freedesktop.org/wiki/Software/ModemManager/"
 arch=(aarch64)
 license=(
@@ -80,6 +87,9 @@ prepare() {
 
   # Omarchy Mobile: the netlink use-after-free (header)
   git cherry-pick -n 9317cbc4702c7d6283e42a498cd9812e19eeccf3
+
+  # Omarchy Mobile: the bearer-count assertion at cleanup with multiplexed bearers
+  git cherry-pick -n 0edcb916ad2b7267caf73bbd9a31e46da0727a00
 }
 
 build() {

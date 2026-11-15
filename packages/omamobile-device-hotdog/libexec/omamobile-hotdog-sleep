@@ -1,0 +1,100 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# systemd-sleep hook for the OnePlus 7T Pro (device/hotdog/SUSPEND-PLAN.md),
+# linked from /usr/lib/systemd/system-sleep/omamobile-hotdog. systemd-sleep
+# runs it as
+#   omamobile-hotdog-sleep pre|post suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+# Only "systemctl suspend" (logind, as omamobile-sleepd asks) gets here; a
+# write to /sys/power/state skips it.
+#
+# pre:  let the modem's QRTR channel (GLINK IPCRTR) wake the phone, so an
+#       incoming call or SMS ends the sleep. Needs a kernel with "rpmsg:
+#       qcom: glink: support waking up on channel rx", which makes every
+#       GLINK channel wakeup-capable but leaves waking off; only this one is
+#       turned on (the ADSP's and CDSP's stay off). Done before every sleep
+#       rather than once from udev: the channel's wakeup file appears just
+#       after its add event, and a modem restart makes a new channel.
+#       ModemManager keeps the modem but tells it to send only calls and
+#       texts while the phone sleeps (--test-quick-suspend-resume, its
+#       drop-in), so routine reports don't wake it.
+# post: log what woke the phone.
+set -uo pipefail
+
+log() { echo "omamobile-hotdog-sleep: $*"; }
+
+channels=/sys/bus/rpmsg/devices
+quiet_ms=${OMAMOBILE_HOTDOG_SLEEP_QUIET_MS:-1500}
+settle_ms=${OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS:-8000}
+step_ms=250
+
+# Messages on the armed channel so far (each is a wakeup event)
+events() { cat "$channels"/4080000.remoteproc:glink-edge.IPCRTR.*/power/wakeup_active_count 2>/dev/null | head -n 1; }
+
+net=/sys/class/net
+
+# Every wireless interface that is up goes down (ath10k stops its firmware)
+wifi_down() {
+  local d
+  for d in "$net"/*; do
+    # Administratively up: IFF_UP (bit 0 of flags), whatever the carrier
+    [[ -e $d/phy80211 ]] && (( $(cat "$d/flags" 2>/dev/null || echo 0) & 1 )) || continue
+    ip link set dev "${d##*/}" down 2>/dev/null && log "${d##*/} down for the sleep"
+  done
+}
+
+modem_channel_wake() {
+  local f n=0 last now quiet=0 waited=0
+  for f in "$channels"/4080000.remoteproc:glink-edge.IPCRTR.*/power/wakeup; do
+    [[ -e $f ]] || continue
+    if [[ $(<"$f") != enabled ]]; then
+      echo enabled > "$f" 2>/dev/null || { log "could not arm $f"; continue; }
+    fi
+    n=$((n + 1))
+  done
+  if ((n == 0)); then
+    log "no wakeup-capable modem QRTR channel (kernel without GLINK wakeup, or the modem is down): calls and texts won't wake the phone"
+    return 0
+  fi
+  # Going to sleep makes the modem talk: ModemManager's terse mode,
+  # NetworkManager taking mobile data down, and their replies. A message that
+  # lands while the kernel suspends its devices aborts the sleep, as a call
+  # should, so wait until the channel has been quiet for a moment (S5).
+  # Wi-Fi too: its firmware's QMI service (WLFW) is on the modem's QRTR
+  # node, and NetworkManager leaves wlan0 up (only disconnected) for the
+  # sleep, so mac80211 stopped the radio inside the device suspend and the
+  # firmware's reply aborted it, every time. Take the link down first, so
+  # that exchange happens here; NetworkManager raises it again at wake.
+  wifi_down
+  last=$(events)
+  while ((quiet < quiet_ms && waited < settle_ms)); do
+    sleep "0.$((step_ms / 10))"
+    waited=$((waited + step_ms))
+    now=$(events)
+    if [[ $now == "$last" ]]; then quiet=$((quiet + step_ms)); else quiet=0 last=$now; fi
+  done
+  if ((quiet >= quiet_ms)); then
+    log "the modem's QRTR channel can wake the phone (quiet after ${waited} ms)"
+  else
+    log "the modem's QRTR channel can wake the phone (still busy after ${settle_ms} ms: the sleep may be aborted)"
+  fi
+}
+
+wake_reason() {
+  local irq name
+  irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null) || irq=
+  if [[ -n $irq ]]; then
+    name=$(awk -v i="$irq:" '$1 == i { $1 = ""; print; exit }' /proc/interrupts | tr -s ' ')
+    log "woken by IRQ $irq:${name:- (unknown)}"
+  else
+    # A wakeup event rather than an interrupt marked for wake (the modem's
+    # channel reports one): name the source that fired last.
+    name=$(awk 'NR > 1 && $9 > max { max = $9; n = $1 } END { print n }' /sys/kernel/debug/wakeup_sources 2>/dev/null)
+    log "no wake IRQ recorded${name:+ (latest wakeup source: $name)}"
+  fi
+}
+
+case "${1:-}/${2:-}" in
+  pre/suspend) modem_channel_wake ;;
+  post/suspend) wake_reason ;;
+esac
+exit 0

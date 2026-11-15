@@ -1,23 +1,25 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Modem plan (hotdog / SM8150): the radio, SMS, data and calls
 
-**Status (2026-11-14): calls and SMS work with the owner's SIM, from a RAM
-boot of the voice kernel. SMS both ways; calls both ways with audio on the
-speaker and the earpiece (R4, R5, R7, V1-V4); the radio ran 24 minutes
-without a SIM before that without a crash (R2). Open: echo and a crackle on
-the uplink (no echo canceller yet), the earpiece's level, five modem crashes
-40 s apart after some boots; mobile data works from the quick settings
-(R6, with `omamobile-shell` 0.2.129 and the patched ModemManager); Kernel branch
-`omamobile-hotdog-voice` (worktree `~/omamobile-kernel/wt-hotdog-voice`,
-output `~/omamobile-kernel/out-hotdog-voice`) @ `bcfa573612aa` on
-`boot_a` since 2026-11-14 (V5), overlay
+**Status (2026-11-15): calls, SMS, MMS and mobile data work with the owner's
+SIM, on kernel `omamobile-hotdog-voice` @ `ce58cc9c3759` in `boot_a` (R9e;
+slot A marked successful again, BRINGUP-M1).
+SMS both ways; calls both ways on the speaker and the earpiece (R4, R5, R7,
+V1-V4b); mobile data from the quick settings (R6, `omamobile-shell` 0.2.129
+and the patched ModemManager); MMS (R8, mmsd-tng, patched omatel-agent and
+omamessages). The owner reported the echo and the earpiece's level as good
+on the evening of 11-14. The five modem crashes 40 s apart after some boots
+are a kernel bug, a QRTR HELLO race (R9): upstream's fix is cherry-picked
+(`ce58cc9c3759`; its first RAM boot on 11-15 hit the race and the modem
+stayed up, R9d; in `boot_a` since 11-15, R9e), and the crash dump at shutdown
+is gone with `omamobile-device-hotdog` 0.1.10 (rmtfs no longer stops the
+modem; its first reboot on 11-15 reached `systemd-shutdown` and came back by
+itself, R9c; ModemManager 1.24.2-2.2 no longer aborts at its stop). Worktree
+`~/omamobile-kernel/wt-hotdog-voice`, output
+`~/omamobile-kernel/out-hotdog-voice`, overlay
 [`overlays/voice.dtso`](overlays/voice.dtso), services
 `omamobile-hotdog-call-audio` and `omamobile-hotdog-sim-select` in
-`omamobile-device-hotdog` 0.1.8. MMS is installed (mmsd-tng, patched
-omatel-agent and omamessages; R8) and waits for the owner's send and
-receive test; the earpiece is quieter and plays alone from kernel `gbcfa573612aa`
-and `omamobile-device-hotdog` 0.1.9 (V4b); both echo cancellers left the
-uplink silent (V3b), so calls run without one and the echo stays open.**
+`omamobile-device-hotdog`.**
 
 ```
 modem DSP (MPSS, remoteproc "modem", qcom/sm8150/oneplus/hotdog/modem.mbn)
@@ -61,6 +63,41 @@ modem DSP (MPSS, remoteproc "modem", qcom/sm8150/oneplus/hotdog/modem.mbn)
   state the modem reads from SMEM (`rf cable state 0 -> 1` in the log): with
   it, R2 below ran clean. A modem stop/start has not been tried on our kernel
   (the five crash recoveries at the first boot on 2026-11-04 left UFS alone).
+- **The five crashes 40 s apart (R9)** are a race in 7.3's QRTR core, not
+  in the modem or our services. Since 544d85de4dc2 ("net: qrtr: Send HELLO
+  message on endpoint register") the core refuses every packet but HELLO to a
+  node (`-EAGAIN`) until its own HELLO has gone out. When the modem's HELLO
+  reaches the name service first, the name service's answer (NEW_SERVER for
+  every local service: rmtfs, tqftpserv, the PD mapper) is refused, logged as
+  `failed to announce new service` and `failed while handling packet from
+  0:-2`, and nothing announces them again. The modem waits for rmtfs, never
+  asks it or tqftpserv for anything, and raises `fatal error without message`
+  40 s after `is now up`. Each recovery rolls the dice again. In the
+  phone's journal, every crash cycle in boots -11, -7 and -2 (4, 4 and 5
+  crashes) has exactly one such pair, and the clean boots have none.
+  Upstream's fix, 743b5c86276b ("net: qrtr: announce local services again
+  once our HELLO is sent", v7.4-rc2, Cc stable), describes the same 40 s
+  modem watchdog on Kaanapali.
+- **The crash dump at shutdown (R9):** the recorded dump
+  (`crashdump-reboot-1818`, from H4's `systemctl reboot bootloader` on
+  11-04) ends with `ipa: received modem stopping event`, 150 ms after the
+  reboot's SSH session closed, and nothing after it. That line is the start of a clean modem stop,
+  which `rmtfs -s` begins on SIGTERM when systemd stops `omamobile-rmtfs`,
+  while the root file system is still mounted read-write. The last clean
+  stop that worked on this phone was on the 7.0 test kernel at runtime (11-01,
+  `stopping` to `offline` in 0.2 s). Which step of the stop the SoC dies in is
+  not known: Linux's download mode is off (`qcom_scm.download_mode=off`), so
+  the dump comes from the secure side, and there is no oops in the log. The
+  modem's EFS writes are discarded anyway (`-r`), so nothing is lost by not
+  stopping it, which is what 0.1.10 does. On 11-15 a power-off of the
+  RAM-booted kernel with 0.1.9 dumped again (`crashdump-1130-r9d-ramkernel`;
+  its kernel log goes quiet after the fingerprint stack's QSEE teardown,
+  with ModemManager, which rmtfs is ordered before, still dumping core), and
+  the reboot with 0.1.10 right after ran the same QSEE teardown and
+  ModemManager crash, killed rmtfs, and reached `systemd-shutdown` and
+  `Journal stopped` for the first time in the last 15 boots (all earlier
+  journals end in the first second of the shutdown). The one difference
+  between the two is the modem stop, so it points there (one run each).
 - **Stock's call path** (`mixer_paths_tavil.xml`, the owner's OxygenOS
   10.0.14): `voicemmode1-call` = `QUAT_MI2S_RX_Voice Mixer VoiceMMode1` and
   `VoiceMMode1_Tx Mixer SLIM_0_TX_MMode1`; `handset-mic` = AMIC4; handset =
@@ -97,7 +134,7 @@ done | diff - ~/android/reference/hotdog/nv-2026-11-14/SHA256SUMS && echo same
 | --- | --- |
 | `omamobile-device-hotdog` 0.1.7 | `omamobile-hotdog-sim-select` (activates the USIM as the primary subscription at boot and after modem restarts); ModemManager unmasked, started at boot after rmtfs and tqftpserv (drop-in, `depends` on `modemmanager`); `oem_stanvbk`/`oem_dycnvbk` named in `/dev/disk/by-partlabel` from `PARTNAME` (only those two); the read-only rule also by `PARTNAME`; `omamobile-hotdog-call-audio` (user unit) |
 | kernel `omamobile-hotdog-voice` | the q6voice series from the postmarketOS SDM845 kernel (`sdm845/7.1-dev`: shared sessions, MVM, CVP, CVS, voice DAI with SLIMbus and MI2S ports, CVD 2.3 init and topology controls, 18 commits by Stephan Gerhold, Vincent Knecht, Richard Acayan, Otto Pflüger and Joel Selvaraj, applied unchanged); the voice services and a `VoiceMMode1` link in our DT, disabled; `tfa9872`: an `Amp Switch` per amplifier (`Top Amp Switch`, `Bottom Amp Switch`) |
-| `packages/modemmanager` 1.24.2-2.1 | Arch's ModemManager with upstream `9317cbc4` (the netlink use-after-free that crashed every data reconnect) |
+| `packages/modemmanager` 1.24.2-2.2 | Arch's ModemManager with upstream `9317cbc4` (the netlink use-after-free that crashed every data reconnect) and, from 2.2, `0edcb916` (the bearer-count abort at every stop with data on, R9) |
 | `omamobile-shell` 0.2.129 | `omamobile-mobile-network`'s ModemManager/NetworkManager path; the Mobile data tile uses it without `omamobile-sit` |
 | `omamobile-device-hotdog` 0.1.8 | `depends` on `mmsd-tng` and starts it in the user's session (vendor wants link); `omamobile-hotdog-call-audio` reads `/etc/omamobile/call-audio.conf` (`tx_topology`, `mics` 1 or 2, `earpiece_gain`) and sets the kernel's optional `VoiceMMode1 TX Channels` and `Top Speaker Gain` when they exist |
 | `packages/mmsd-tng` 2.6.4.r2 | the MMS daemon (`org.ofono.mms` on the session bus), with a user unit |
@@ -105,6 +142,8 @@ done | diff - ~/android/reference/hotdog/nv-2026-11-14/SHA256SUMS && echo same
 | kernel `omamobile-hotdog-voice` @ `bcfa573612aa` | `tfa9872`: `Speaker Gain` (TDMSPKG, `TDM_CFG8` bits 9:6; NXP's container profiles use 4 for the speaker and 13 for the receiver); q6voice (hack): `VoiceMMode1 TX Channels` (1-3, the CVP channel info and media format of the CVD 2.3 sequence) and `cvd_v2_3_override` (module parameter, -1 = the DT) |
 | `device/hotdog/kernel-voice.config` | `CONFIG_SND_SOC_QDSP6_Q6VOICE=m`, appended for the test kernel only |
 | `overlays/voice.dtso` | turns on MVM, CVS, CVP and the `VoiceMMode1` link |
+| kernel `omamobile-hotdog-voice` @ `ce58cc9c3759` | upstream 743b5c86276b, cherry-picked: the QRTR core replays the remote's HELLO to the name service once our HELLO is out, so the modem learns the local services (R9) |
+| `omamobile-device-hotdog` 0.1.10 | `omamobile-rmtfs` ends rmtfs with SIGKILL, so it no longer stops the modem at shutdown; `omamobile-hotdog-modem-recovery` turns the modem's recovery off before that and on again at start (R9) |
 
 Not done: VoLTE
 (the modem's carrier configurations, MCFG, are served but none is selected:
@@ -118,8 +157,10 @@ USB.
   `qmicli --dms-set-...` that writes NV (`--dms-set-user-data`,
   `--dms-restore-factory-defaults`, `--nas-set-...` with persistence).
   Operating-mode changes are not persistent.
-- A modem stop/start (restarting `omamobile-rmtfs` does one, through `-s`) is
-  untested on this kernel and broke UFS on the 11-01 kernel: reboot instead.
+- A modem stop/start broke UFS on the 11-01 kernel, and a clean stop at
+  shutdown ended in a crash dump on ours (R9): reboot instead. Up to
+  `omamobile-device-hotdog` 0.1.9, stopping or restarting `omamobile-rmtfs`
+  stops the modem (`-s`); from 0.1.10 it leaves the modem running.
 - New kernels RAM-boot first (`fastboot boot`, no slot-A try spent); `boot_a`
   is written only by the owner, by fastboot, after a RAM boot passed.
 
@@ -357,3 +398,126 @@ to `boot_a` (tries reset to 7, `slot-successful:a` stays as it is).
 in 10 s: no failed units, no modem crash or UFS error handler, LTE home,
 data connected; the agent came up `ready` (not `emergency-only`) with
 `MmsReady` true.*
+
+**R9. Modem crashes at boot and the crash dump at shutdown.** Cause and
+evidence in §0. Two independent changes, tested one at a time: the package
+first (on the kernel in `boot_a`), then the kernel.
+
+*R9a. Build (laptop, done 2026-11-14).* `git cherry-pick -x 743b5c86276b` on
+`omamobile-hotdog-voice` (`ce58cc9c3759`, upstream's own sign-offs, checkpatch
+clean), then V0's commands unchanged:
+`7.3.0-rc6-omamobile-push1-gce58cc9c3759`, boot.img sha256 `c2a7ec96…`, kept
+as `~/omamobile-kernel/boot-voice-gce58cc9c3759-qrtr-2026-11-14.img`; modules
+in `out-hotdog-voice/modules-7.3.0-rc6-omamobile-push1-gce58cc9c3759.tar.zst`.
+`omamobile-device-hotdog` 0.1.10: `test/all` passes.
+
+*R9b. Install 0.1.10 (owner's yes).*
+`tools/phone-install-package packages/omamobile-device-hotdog`, then
+`systemctl daemon-reload`. Don't restart `omamobile-rmtfs` (with 0.1.9's
+unit still running, a restart stops the modem). Pass: `systemctl show
+omamobile-rmtfs -p KillSignal` reads 9, `-p ExecStop` names
+`omamobile-hotdog-modem-recovery disabled`, the modem still `running`.
+Rollback: install 0.1.9 again. Risk: low.
+
+*R9c. A reboot with 0.1.10 (owner's yes; screen goes off).* Stream the kernel
+log first: `tools/phone-ssh --fresh 'dmesg -w' > logs/hotdog-r9c-reboot.log &`,
+then `tools/phone-ssh 'systemctl reboot'`. Expect: no `modem stopping` line
+in the stream; the phone comes back to Arch on its own (`boot_a`, one slot-A
+try). Pass: back in about 30 s; `journalctl -b -1 -u omamobile-rmtfs` shows
+`modem recovery disabled` at the stop. Stop: the phone stays black and the
+laptop sees `05c6:900e` (`lsusb`): hold Power until it resets, then note the
+stream's last lines. If it still dumps, the next suspect is IPA's own
+shutdown (`ipa_remove` tears down the modem's endpoints with the modem
+running). Rollback: 0.1.9. Risk: medium (a crash dump is what happens at a
+reboot today; with 0.1.10 the modem is never touched before systemd has
+remounted the root read-only).
+
+*R9d. RAM boot of `gce58cc9c3759` (owner: fastboot by the buttons).* Modules
+first, while the phone runs:
+`DEVICE=hotdog KERNEL_OUT=~/omamobile-kernel/out-hotdog-voice bin/omamobile modules-push`,
+then `fastboot -s <serial> boot
+~/omamobile-kernel/boot-voice-gce58cc9c3759-qrtr-2026-11-14.img`. Pass:
+`uname -r` ends in `gce58cc9c3759`; `dmesg | grep 'crash detected in modem'`
+is empty after 3 minutes (the error pair `failed to announce new service` /
+`failed while handling packet` still appears when the race hits: the fix
+doesn't stop the first announcement failing, it announces again once our
+HELLO is out); tqftpserv's `ota_firewall`
+lines and ath10k's `qmi chip_id` come within 2 s of `modem is now up`;
+calls, SMS and data as before. Stop: a modem crash with that error pair
+(the fix didn't take), or the known bad RAM boots (UFS/DPU: retry).
+Rollback: a reboot (`boot_a` is unchanged). Risk: low.
+
+*R9d result, 2026-11-15, `7.3.0-rc6-omamobile-push1-gce58cc9c3759`
+(RAM boot from button fastboot, `slot-retry-count:a` 6): pass, on a boot
+that hit the race.* `modules-push` installed the release beside the others
+(`qrtr.ko` vermagic matches). The modem came up at 8.49 s with the error
+pair logged in the same millisecond, the boot that crashed 40 s later on
+`gbcfa573612aa`. This time ath10k's `qmi chip_id` came at 10.49 s,
+tqftpserv got the modem's `ota_firewall` requests at once, Wi-Fi associated
+at 16.9 s, and at 186 s of uptime there was no `crash detected` or `fatal
+error` line; the modem was `running`, registered (home), with mobile data
+connected over `qrtr0`. Log: `logs/hotdog-r9d-ramboot.log` (holds MACs:
+never quote it whole). Calls and SMS were not tried on this boot.
+
+*R9b/R9c results, 2026-11-15, `7.3.0-rc6-omamobile-push1-gbcfa573612aa`
+(`boot_a`): pass.* R9b: 0.1.10 installed, `KillSignal=9`, the stop hook in
+place, the modem still `running`. For R9c systemd's log went to the kernel
+log (`sysctl kernel.printk_devkmsg=on`, `systemd-analyze set-log-target
+kmsg`; both reset at the reboot), so a dump would carry the shutdown's unit
+steps in its ramoops. `systemctl reboot` at 11:38:28; the phone answered SSH
+again at 11:38:55, no crash dump. `journalctl -b -1`: the fingerprint
+stack's QSEE teardown at 280.97 s, ModemManager's assertion at 280.94 s
+(below), `omamobile-hotdog-modem-recovery: modem recovery disabled` at
+281.56 s, rmtfs `status=9/KILL` at 281.60 s, no `modem stopping` line,
+`systemd-shutdown` syncing at 286.33 s, `Journal stopped` at 286.46 s.
+One reboot, and the owner powers off more often than reboots: a power-off
+that ends with the phone off (no `05c6:900e` on the cable) is the next
+check.
+
+- **ModemManager aborts at every shutdown since 11-14** (boots -4 to 0):
+  `mm_iface_modem_count_bearers: assertion failed: (max >= ctx.count)` from
+  `mm_base_manager_cleanup`, with a core dump. Harmless for the shutdown
+  (R9c passed with it). Cause: over IPA every bearer is multiplexed, so
+  the QMI modem's bearer list allows 0 non-multiplexed active bearers, and
+  1.24.2's cleanup counts the connected data bearer against that 0 alone.
+  Upstream fixed it on `main` (`0edcb916`, "base-manager: fix cleanup of
+  multiplexed bearers"); `packages/modemmanager` 1.24.2-2.2 cherry-picks it.
+  2026-11-15: 2.2 built on the phone (makepkg by hand: `tools/phone-install-package`
+  refuses a split package whose `modemmanager` asks for its own new
+  `libmm-glib`) and installed; `systemctl restart ModemManager` (the old
+  binary aborted one last time, pid 1076), data connected again, then
+  `systemctl stop ModemManager` with data on: `Result=success`, exit 0, no
+  core dump; started again, connected.
+- **Reading a dump:** the bring-up's `sahara-dump` (not in this repository) needs pyusb
+  (a scratch venv works: `sudo venv/bin/python sahara-dump DIR RANGES`), and
+  it resets the phone at the end, so name every range in one run. Besides
+  ramoops (`0xa9800000:0x400000`) and KMSG (`0xa997f008:0x3fff4`), the
+  memory table offers `Pmic PON stat` `0x85e96000:0x8`, `PM PON HIST`
+  `0x85e96008:0xcc`, `Reset Status` `0x85e960d4:0x4`, the AOSS reset FSM
+  `0x85e960dc:0x8` and `OCIMEM` `0x14680000:0x40000`; the 11-15 read took
+  only the first two.
+
+*R9e. Repeat (owner).* The race hit 3 of the last 12 boots, so one clean
+boot proves little, and a RAM-booted kernel is gone after a reboot. So
+after R9d the owner flashes it to `boot_a` (as V5, tries reset to 7;
+rollback image `boot-voice-gbcfa573612aa-2026-11-14.img`), and the crashes
+are counted over the next ten boots with
+`for b in $(seq -9 0); do journalctl -k -b $b | grep -c 'crash detected in modem'; done`.
+Pass: 0 in all ten (the announce error pair may still appear; it marks the
+boots that hit the race). The ten are the owner's ordinary boots, not a
+reboot loop: slot A is not marked successful, so every boot spends one of
+its 7 tries, and at 0 ABL turns to slot B, which holds no system; the next
+`boot_a` flash resets them.
+
+*R9c/R9e results, 2026-11-15.* A `systemctl poweroff` with 0.1.10 (same
+logging as R9c) ran to `systemd-shutdown` and `Journal stopped` and the
+phone switched off, no `05c6:900e`; with the cable in, the charger started
+it again (`androidboot.startupmode=dc_charger`). `systemctl reboot
+--reboot-argument=bootloader` (`systemctl reboot bootloader` takes no
+argument on this systemd) reached fastboot in 11 s, the step that dumped on
+11-04 (H4). From there `boot-voice-gce58cc9c3759-qrtr-2026-11-14.img` was
+flashed to `boot_a` (`slot-retry-count:a` 3 before, 7 after,
+`slot-successful:a` no). Boot 1 of R9e, `7.3.0-rc6-omamobile-push1-gce58cc9c3759`:
+the race hit again (the pair at 8.11 s), ath10k's `qmi chip_id` at 10.08 s,
+no modem crash at 70 s, data connected, registered home. With the RAM boot
+that is two raced boots and no crash.

@@ -35,7 +35,10 @@ first_usim() {
 select_once() {
   local status slot aid
   status=$(qmi --uim-get-card-status) || return 1
-  grep -c "Primary GW: *session doesn't exist" <<<"$status" >/dev/null || return 0
+  # A session exists: nothing to do, and the next look can wait (each look
+  # is QMI traffic, and a reply that lands while the phone goes to sleep
+  # aborts the sleep: SUSPEND-PLAN S5)
+  grep -c "Primary GW: *session doesn't exist" <<<"$status" >/dev/null || return 2
   read -r slot aid < <(first_usim <<<"$status") || true
   [[ -n ${slot:-} && -n ${aid:-} ]] || return 0
   if qmi --uim-change-provisioning-session="slot=$slot,activate=yes,session-type=primary-gw-provisioning,aid=$aid" >/dev/null; then
@@ -54,7 +57,10 @@ if [[ ${1:-} == --once ]]; then
   select_once
   exit 0
 fi
+# Every $interval s until the session exists, then every $idle_interval s
+# (a modem restart drops the session: it is found again within that time)
+idle_interval=${OMAMOBILE_SIM_SELECT_IDLE_INTERVAL:-60}
 while :; do
   select_once
-  sleep "$interval"
+  if (($? == 2)); then sleep "$idle_interval"; else sleep "$interval"; fi
 done
