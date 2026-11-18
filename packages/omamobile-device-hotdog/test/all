@@ -6,7 +6,8 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 for f in PKGBUILD build install bin/* lib/omamobile-fp-hotdog-chroot libexec/omamobile-hotdog-sim-select \
-    libexec/omamobile-hotdog-modem-recovery libexec/omamobile-hotdog-sleep; do bash -n "$f"; done
+    libexec/omamobile-hotdog-modem-recovery libexec/omamobile-hotdog-sleep \
+    libexec/omamobile-hotdog-sensors-root libexec/omamobile-hotdog-sensors-ready; do bash -n "$f"; done
 python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' libexec/omamobile-hotdog-call-audio
 echo "ok - scripts parse"
 python3 -B test/call-audio.py
@@ -154,7 +155,9 @@ for f in usr/lib/omamobile/hotdog/rmtfs usr/lib/omamobile/hotdog/tqftpserv usr/b
     usr/share/wireplumber/wireplumber.conf.d/51-omamobile-hotdog-mic.conf \
     usr/lib/omamobile/hotdog/omamobile-hotdog-popup usr/lib/systemd/system/omamobile-hotdog-popup.service \
     usr/lib/omamobile/hotdog/omamobile-hotdog-modem-recovery \
-    usr/lib/udev/rules.d/70-omamobile-dma-heap.rules usr/share/libcamera/configuration.yaml; do
+    usr/lib/udev/rules.d/70-omamobile-dma-heap.rules usr/share/libcamera/configuration.yaml \
+    usr/lib/omamobile/hotdog/omamobile-hotdog-sensors-root usr/lib/omamobile/hotdog/omamobile-hotdog-sensors-ready \
+    usr/lib/systemd/system/omamobile-hotdog-sensors.service usr/lib/udev/rules.d/81-omamobile-hotdog-sensors.rules; do
   [[ -e $stage/$f ]] || { echo "not ok - install misses $f"; exit 1; }
 done
 [[ ! -e $stage/etc/systemd/system/ModemManager.service && ! -L $stage/etc/systemd/system/ModemManager.service ]] ||
@@ -168,6 +171,15 @@ grep -cx 'After=omamobile-rmtfs.service omamobile-tqftpserv.service' \
 [[ -x $stage/usr/lib/omamobile/hotdog/omamobile-hotdog-call-audio && \
    $(readlink "$stage/usr/lib/systemd/user/default.target.wants/omamobile-hotdog-call-audio.service") == ../omamobile-hotdog-call-audio.service ]] ||
   { echo "not ok - call audio service"; exit 1; }
+# The sensors: hexagonrpcd follows the SLPI's FastRPC node (udev starts it,
+# the device's removal stops it), and its root is built read-only
+grep -cx 'BindsTo=dev-fastrpc\\x2dsdsp.device' "$stage/usr/lib/systemd/system/omamobile-hotdog-sensors.service" >/dev/null &&
+  grep -c 'KERNEL=="fastrpc-sdsp".*SYSTEMD_WANTS}+="omamobile-hotdog-sensors.service"' \
+    "$stage/usr/lib/udev/rules.d/81-omamobile-hotdog-sensors.rules" >/dev/null ||
+  { echo "not ok - sensors service not bound to the SLPI's node"; exit 1; }
+grep -c 'debugfs -c ' libexec/omamobile-hotdog-sensors-root >/dev/null && grep -c 'losetup -r ' libexec/omamobile-hotdog-sensors-root >/dev/null &&
+  ! grep -E 'debugfs +-w|mount |losetup +(-f|--find)? *[^r-]' libexec/omamobile-hotdog-sensors-root >/dev/null ||
+  { echo "not ok - the sensors root is not built read-only"; exit 1; }
 echo "ok - staged install"
 # The cameras: the CPU debayer (the GPU one gives zero frames on this GPU),
 # and the user's session may allocate the ISP's buffers
