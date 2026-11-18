@@ -12,7 +12,8 @@ echo "ok - scripts parse"
 python3 -B test/call-audio.py
 echo "ok - call audio routes and restores"
 # The SIM selection against a recorded card status (no ICCID in it): it
-# activates slot 1's USIM, and does nothing when a session exists
+# activates slot 1's USIM, and does nothing (exit 2: look again later) when a
+# session exists or no SIM is inserted
 fake=$(mktemp -d)
 cat > "$fake/qmicli" <<'Q'
 #!/bin/bash
@@ -40,8 +41,19 @@ PATH=$fake:$PATH FAKE_STATUS=$fake/status FAKE_LOG=$fake/log libexec/omamobile-h
 grep -c "slot=1,activate=yes,session-type=primary-gw-provisioning,aid=A0:00:00:00:87:10:02:FF:FF:FF:FF:89:00:00:00:00" "$fake/log" >/dev/null ||
   { echo "not ok - SIM selection"; exit 1; }
 sed -i "s/session doesn't exist/slot '1', application '1'/" "$fake/status"; : > "$fake/log"
-PATH=$fake:$PATH FAKE_STATUS=$fake/status FAKE_LOG=$fake/log libexec/omamobile-hotdog-sim-select --once >/dev/null
-[[ ! -s $fake/log ]] || { echo "not ok - SIM selection with a session"; exit 1; }
+rc=0; PATH=$fake:$PATH FAKE_STATUS=$fake/status FAKE_LOG=$fake/log libexec/omamobile-hotdog-sim-select --once >/dev/null || rc=$?
+[[ ! -s $fake/log && $rc == 2 ]] || { echo "not ok - SIM selection with a session"; exit 1; }
+# No SIM inserted: nothing to activate, and the next look waits
+cat > "$fake/status" <<'S'
+Provisioning applications:
+	Primary GW:   session doesn't exist
+Slot [1]:
+	Card state: 'absent'
+Slot [2]:
+	Card state: 'error: no-atr-received (3)'
+S
+rc=0; PATH=$fake:$PATH FAKE_STATUS=$fake/status FAKE_LOG=$fake/log libexec/omamobile-hotdog-sim-select --once >/dev/null || rc=$?
+[[ ! -s $fake/log && $rc == 2 ]] || { echo "not ok - SIM selection with no SIM"; exit 1; }
 rm -rf "$fake"
 echo "ok - SIM selection"
 for f in libexec/omamobile-hotdog-popup libexec/omamobile-hotdog-call-audio; do
@@ -199,11 +211,24 @@ done
 mkdir -p "$sys/net/wlan0/phy80211" "$sys/net/usb0" "$sys/bin"
 echo 0x1003 > "$sys/net/wlan0/flags"; echo 0x1003 > "$sys/net/usb0/flags"
 printf '#!/bin/sh\necho "ip $*" >> "%s/ip.log"\n' "$sys" > "$sys/bin/ip"; chmod +x "$sys/bin/ip"
-sed "s#/sys/bus/rpmsg/devices#$sys#; s#^net=/sys/class/net#net=$sys/net#" libexec/omamobile-hotdog-sleep > "$sys/hook"
-grep -c "^net=$sys/net" "$sys/hook" >/dev/null || { echo "not ok - the hook's net path is not stubbed"; exit 1; }
-export OMAMOBILE_HOTDOG_SLEEP_QUIET_MS=500 OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS=1500
+# A fake /sys/power, remote processors and wakeup sources: never the real ones
+mkdir -p "$sys/power" "$sys/rproc/remoteproc0"
+echo 42 > "$sys/power/wakeup_count"; echo modem > "$sys/rproc/remoteproc0/name"; echo running > "$sys/rproc/remoteproc0/state"
+mkdir -p "$sys/supply/bat" "$sys/supply/usb"; echo Battery > "$sys/supply/bat/type"; echo USB > "$sys/supply/usb/type"
+echo 74 > "$sys/supply/bat/capacity"; echo 2231000 > "$sys/supply/bat/charge_now"; echo Discharging > "$sys/supply/bat/status"
+printf 'name\tactive_count\tevent_count\twakeup_count\texpire_count\tactive_since\n4080000.remoteproc\t1\t1\t0\t0\t2500\n' > "$sys/wakeup_sources"
+sed "s#/sys/bus/rpmsg/devices#$sys#; s#^net=/sys/class/net#net=$sys/net#; s#^power=/sys/power#power=$sys/power#
+     s#^rprocs=/sys/class/remoteproc#rprocs=$sys/rproc#; s#^supplies=/sys/class/power_supply#supplies=$sys/supply#; s#^sources=/sys/kernel/debug/wakeup_sources#sources=$sys/wakeup_sources#" \
+  libexec/omamobile-hotdog-sleep > "$sys/hook"
+for v in net power rprocs sources supplies; do
+  grep -c "^$v=$sys/" "$sys/hook" >/dev/null || { echo "not ok - the hook's $v path is not stubbed"; exit 1; }
+done
+export OMAMOBILE_HOTDOG_SLEEP_QUIET_MS=500 OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS=1500 OMAMOBILE_HOTDOG_SLEEP_BUSY_S=2
 out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend)
 [[ $out == *"quiet after 500 ms"* ]] || { echo "not ok - sleep hook waits for a quiet modem channel ($out)"; exit 1; }
+[[ $out == *"armed: a wakeup event from now on cancels the sleep"* && $(<"$sys/power/wakeup_count") == 42 && \
+   $out != *waited* ]] || { echo "not ok - sleep hook arms wakeup_count ($out)"; exit 1; }
+[[ $out == *"battery before the sleep: 74 % (2231000 uAh, Discharging)"* ]] || { echo "not ok - sleep hook logs the battery ($out)"; exit 1; }
 [[ $(cat "$sys/ip.log") == "ip link set dev wlan0 down" ]] || { echo "not ok - the hook takes Wi-Fi (only) down before the sleep"; exit 1; }
 rm -rf "$sys/net/wlan0/phy80211"
 # A channel that keeps talking: the hook gives up after the settle time
@@ -215,7 +240,21 @@ out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend); wait
    $out == *"can wake the phone"* ]] || { echo "not ok - sleep hook arms the modem channel only"; exit 1; }
 rm -rf "$sys/4080000.remoteproc:glink-edge.IPCRTR.-1.-1"
 [[ $(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend) == *"won't wake the phone"* ]] || { echo "not ok - sleep hook without a modem channel"; exit 1; }
-bash "$sys/hook" post suspend >/dev/null
-unset OMAMOBILE_HOTDOG_SLEEP_QUIET_MS OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS
+# A remote processor restarting after a crash: wait for it (2 s at most here)
+echo crashed > "$sys/rproc/remoteproc0/state"
+( sleep 1; echo running > "$sys/rproc/remoteproc0/state" ) &
+out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend); wait
+[[ $out == *"waited 1 s"* || $out == *"waited 2 s"* ]] || { echo "not ok - sleep hook waits for a restarting remote processor ($out)"; exit 1; }
+echo crashed > "$sys/rproc/remoteproc0/state"
+out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend)
+[[ $out == *"still busy after 2 s (crashed: modem; active: 4080000.remoteproc)"* ]] ||
+  { echo "not ok - sleep hook bounds its wait for a remote processor ($out)"; exit 1; }
+echo running > "$sys/rproc/remoteproc0/state"
+# wakeup_count can't be armed: said so, and the sleep goes ahead
+rm "$sys/power/wakeup_count"; mkdir "$sys/power/wakeup_count"
+out=$(PATH=$sys/bin:$PATH bash "$sys/hook" pre suspend)
+[[ $out == *"could not arm wakeup_count"* ]] || { echo "not ok - sleep hook without wakeup_count ($out)"; exit 1; }
+[[ $(bash "$sys/hook" post suspend) == *"battery after the sleep: 74 %"* ]] || { echo "not ok - sleep hook logs the battery after"; exit 1; }
+unset OMAMOBILE_HOTDOG_SLEEP_QUIET_MS OMAMOBILE_HOTDOG_SLEEP_SETTLE_MS OMAMOBILE_HOTDOG_SLEEP_BUSY_S
 rm -rf "$sys"
 echo "ok - suspend"

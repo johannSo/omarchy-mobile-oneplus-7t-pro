@@ -63,6 +63,12 @@ modem DSP (MPSS, remoteproc "modem", qcom/sm8150/oneplus/hotdog/modem.mbn)
   state the modem reads from SMEM (`rf cable state 0 -> 1` in the log): with
   it, R2 below ran clean. A modem stop/start has not been tried on our kernel
   (the five crash recoveries at the first boot on 2026-11-04 left UFS alone).
+  **Update 2026-11-18:** every modem restart with ath10k bound reset the SoC
+  into its crash dump: ath10k returned MSA to HLOS while the modem was still
+  stopping. Fixed by "wifi: ath10k: snoc: keep MSA assigned until the modem
+  is off" (`omamobile-hotdog-sleep`, `f38b21c1fdb9`); with it a restart
+  takes about 0.6 s and Wi-Fi recovers ([SUSPEND-PLAN](SUSPEND-PLAN.md) K7).
+  A kernel without it must not restart the modem with Wi-Fi up.
 - **The five crashes 40 s apart (R9)** are a race in 7.3's QRTR core, not
   in the modem or our services. Since 544d85de4dc2 ("net: qrtr: Send HELLO
   message on endpoint register") the core refuses every packet but HELLO to a

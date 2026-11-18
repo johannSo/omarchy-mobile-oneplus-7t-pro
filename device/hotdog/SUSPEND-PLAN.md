@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Suspend plan (hotdog / SM8150): sleep for battery life
 
-**Status (2026-11-15, evening): S1-S5 pass. Suspend and resume work, and the power key, both volume keys, the alert slider, the RTC and an incoming call wake the phone (sleep kernel `-g123b049ba8f1`, RAM boot; `omamobile-device-hotdog` 0.1.13). Open: the SoC never reaches its deep state (S6: dropping `clk_ignore_unused` wedges the display at boot), an occasional modem wake with no call behind it, the SMS wake test, the drain measurement (S7) and turning it on (S8).**
+**Status (2026-11-18): S1-S5 and the S8 crash fixed. Suspend and resume work, and the power key, both volume keys, the alert slider, the RTC and an incoming call wake the phone. A modem restart (after its own crash) reset the SoC into crash-dump mode; the cause was ath10k returning MSA to HLOS while the modem stopped (K7, `-gf38b21c1fdb9`, RAM boot): with it the modem restarts in 0.6 s, also just before a sleep. `omamobile-device-hotdog` 0.1.15 waits out remote-processor restarts, arms `wakeup_count` and logs the battery at each sleep. Overnight the phone slept with one wake an hour (the modem's `ota_firewall` check, about 0.03 %/h). `boot_a` holds it since 2026-11-18. Open: the SoC's deep state (K6), the exact drain (S7).**
 Kernel: `omamobile-hotdog-keys` (worktree `~/omamobile-kernel/wt-hotdog-keys`,
 output `~/omamobile-kernel/out-hotdog-keys`), running from a RAM boot as
 `7.3.0-rc6-omamobile-push1-g00e3900120f0`. A kernel change for sleep goes on
@@ -212,6 +212,14 @@ re-mark slot A ([BRINGUP-M1](BRINGUP-M1.md)) only after that day.
   they turn out to be what holds XO on.
 - **K4** GLINK channel wakeup (S4, on `omamobile-hotdog-sleep`).
 - **K5** the alert slider as a wakeup source (S4, on `omamobile-hotdog-sleep`).
+- **K7** "wifi: ath10k: snoc: keep MSA assigned until the modem is off"
+  (`f38b21c1fdb9` on `omamobile-hotdog-sleep`, 2026-11-18). Every modem
+  restart reset the SoC into its crash dump: ath10k assigns MSA back to
+  HLOS as soon as the modem's WLAN firmware service leaves, while the modem
+  is still stopping, and the next access to MSA is an XPU violation. It now
+  keeps the permissions from `QCOM_SSR_BEFORE_SHUTDOWN` and returns them at
+  `QCOM_SSR_AFTER_SHUTDOWN` (as downstream's icnss does). Not hotdog-only:
+  every ath10k SNoC board without `qcom,msa-fixed-perm` takes this path.
 
 ## 5. Results
 
@@ -305,12 +313,100 @@ On `7.3.0-rc6-omamobile-push1-g123b049ba8f1` (the sleep kernel, RAM boot),
   bootloader's splash is still on and before `msm` claims them, and the
   display stays wedged. K6.
 
+- **S8, first night** (2026-11-16 19:00 to 11-17 08:07, `-g123b049ba8f1`,
+  `omamobile-shell` 0.2.130, `omamobile-device-hotdog` 0.1.14, the
+  `omamobile-sleep` toggle on, no SIM, cable out from about 19:00 at 100 %):
+  - the night before (toggle off) the phone never slept: about 1.15 W and
+    10 %/h awake with the screen off, until upower's critical action
+    suspended it at 2 %. Omarchy's "Stay awake" was on as well; it blocks
+    `omamobile-sleepd` and had to go off;
+  - with the toggle on, the phone slept from 21:28 to 08:07 with one wake
+    an hour, always at about hh:07:15, each about 14 s awake (cause not read
+    yet: the hook's wake-reason lines are in the journal on the phone). The
+    owner read 74 % at 07:28, so about 2 %/h from 19:00 including the
+    evening's use; upower's history has the exact curve;
+  - 08:07:15, the hourly wake; 0.9 s after the resume the modem's firmware
+    crashed (`watchdog received: rflm_diag_error.cc:368:RFLM@qsf_hl_seq.c:118
+    Assertion (rflm_qlnk_ls_retry_cnt < 2) failed`) and remoteproc began
+    its restart. 08:07:39, `omamobile-sleepd` suspended again (its 5 s grace
+    after a dark resume) with the restart not finished: freezing took 7.5 s,
+    ath10k's QMI to the restarting modem timed out (`failed to send qmi
+    config: -110`), Wi-Fi's firmware crashed, 1.4 s later the CDSP
+    (`fatal error received: SFR Init: wdog or kernel error suspected`), and
+    the log ends where the consoles are suspended. The phone came up in
+    Qualcomm's crash-dump mode and stayed there, screen on, until the
+    afternoon;
+  - why the sleep went ahead: `rproc_report_crash()` holds the parent
+    awake (`pm_stay_awake`, `qcom_q6v5_pas` makes it wakeup-capable) until
+    the restart is done, but an in-progress wakeup event aborts a sleep only
+    when it was armed through `/sys/power/wakeup_count`, and systemd doesn't
+    arm it. `rproc_recovery_wq` is freezable, so the restart then stops
+    halfway for the sleep. Fix in `omamobile-device-hotdog` 0.1.15: the
+    hook first waits (60 s at most) while a remote processor is `crashed` or
+    a wakeup event is in progress (reading `wakeup_count` blocks until none
+    is), then arms the modem's channel and Wi-Fi as before, and last arms
+    `wakeup_count`, so an event from then on cancels the sleep;
+  - how the log was read: in crash-dump mode the phone enumerates as
+    `05c6:900e` and answers Sahara memory-debug. Its region table has
+    `KMSG.txt` at `0xa997f008` (the ramoops console, written uncached, so it
+    holds the last lines), `PMSG`, the PMIC power-on and reset-status words
+    and the four 2 GiB DDR halves. The DDR copy of the printk ring stopped
+    a few lines earlier (the CPUs' caches were never written back), so the
+    ramoops region is the one to read. A USB port reset makes the phone
+    start a new Sahara session; a Sahara reset command reboots it. Dumps
+    hold the phone's memory: private, deleted after reading.
+
+- **The crash, found** (2026-11-18, `boot_a`'s `-gce58cc9c3759` for the
+  bisection, then `-gf38b21c1fdb9`). A modem crash reported through
+  debugfs (`echo 1 > /sys/kernel/debug/remoteproc/remoteproc0/crash`,
+  remoteproc's full crash handling and restart) with the phone awake:
+  - the sleep kernel, recovery on: crash-dump mode 40 ms after `recovering
+    modem` and ath10k's `firmware crashed!`, no sleep involved; the same
+    PMIC power-on and reset-status words as on 11-17;
+  - recovery off: the phone survives, the modem stays `crashed`;
+  - IPA unbound, then `echo recover > .../recovery`: crash dump;
+  - IPA and ath10k unbound: `stopped remote processor modem` and `is now
+    up` within 0.8 s, the phone fine;
+  - K7, Wi-Fi bound and connected, recovery on: three of three restarts in
+    about 0.6 s, ath10k `device successfully recovered`, Wi-Fi connected
+    again; then a crash reported just before a systemd sleep (`CRASH=modem`
+    in `sleep-once`): the modem was up before the hook ran, the hook armed
+    `wakeup_count`, the phone slept and the restarted modem's messages woke
+    it 5 s later.
+
+  So on 11-17 the modem's restart, not the sleep, took the phone down; the
+  hook's wait is still right (the restart work freezes for a sleep). A CDSP
+  crash before a sleep restarts in 80 ms and was harmless before K7 too.
+- **The hourly wake** is the modem asking tqftpserv for
+  `/readwrite/ota_firewall/ruleset` (`modem.mbn` names it next to
+  `/nv/item_files/mcs/ota_firewall/public_keys`: a signed ruleset a carrier
+  sends over the air). The file doesn't exist, the request is refused, and
+  the modem asks again an hour later. An empty file is worse: the modem
+  reads a 4-byte header and retries four times. Each check keeps the phone
+  awake about 14 s, about 0.03 % of the battery an hour: left as it is.
+- **The second night** (11-17 18:20 to 11-18 10:45, `boot_a`'s kernel after
+  the crash dump, without K4, so the modem couldn't wake it): one sleep of
+  16 hours, woken by the power key. Its drain is lost: upower's history had
+  a 1970 clock on that boot. From 0.1.15 the hook logs the level and
+  `charge_now` at every sleep and wake.
+- **Wake sources on `-gf38b21c1fdb9`** (2026-11-18): the RTC, Volume Up,
+  Volume Down, the alert slider (`msmgpio 134`, Vibrate) and the power key
+  (the lock screen lit) all woke it; 6 of 6 sleeps, no UFS or DPU errors,
+  Wi-Fi back each time. Calls untested: no SIM.
+
 ## 6. Next
+
+0. A night on `-gf38b21c1fdb9` with 0.1.15, cable out: the drain asleep
+   from the hook's battery lines (`journalctl -t systemd-sleep | grep
+   battery`). `boot_a` holds this kernel since 2026-11-18, slot A marked
+   again ([BRINGUP-M1](BRINGUP-M1.md)). The
+   modem's RFLM assertion: once in about 12 wakes, 0.9 s after a resume, no
+   SIM; with K7 it costs a modem restart, not the phone.
 
 1. SMS wake (`MODE=systemd SECS=600`, an SMS from another phone).
 2. Find the spurious modem wakes (QRTR debug print).
 3. K6, then S6 again without `clk_ignore_unused`.
 4. S7: `tools/power-ab s2idle --suspend systemd` cable out, now and after K6.
-5. S8: `omamobile-shell` 0.2.130 on the phone (the power-key wake lights the
-   PIN pad), the owner's `omamobile-sleep` toggle, a day of use; then flash
+5. S8: a day of use with auto-sleep on (shell 0.2.130 and the toggle are
+   on the phone since 2026-11-16); then flash
    the sleep kernel to `boot_a` and mark slot A again ([BRINGUP-M1](BRINGUP-M1.md)).

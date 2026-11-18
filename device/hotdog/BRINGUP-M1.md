@@ -231,6 +231,22 @@ successful 0 unbootable 0`); both CRCs valid, copies identical, new sha256
 both copies' header and entry bytes at their offsets; the phone still boots
 to fastboot by the buttons.
 
+**2026-11-18: `boot_a` flashed with `7.3.0-rc6-omamobile-push1-gf38b21c1fdb9`
+(the sleep kernel with the ath10k MSA fix, SUSPEND-PLAN K7; cmdline
+`clk_ignore_unused pd_ignore_unused panic=10 splash`), with the owner's
+yes, and slot A marked again.** The old `boot_a` (96 MiB, sha256
+`660f7239…`) went to `~/android/reference/hotdog/` first, checked against
+the partition. A software `systemctl reboot` with the `bootloader` argument
+reached fastboot in 15 s (on 11-04 it ended in the crash dump; that was most
+likely K7's bug, a modem shutdown with ath10k bound). Before the flash:
+`slot-successful:a` yes, tries 6; after: no, 7. Booted: slot `_a`, normal
+mode, `boot_a` reads back as the image (`6688b310…`), no failed units, all
+remote processors running. `slot-a-mark` `status`, `dump`
+(`~/android/reference/hotdog/gpt/sde-before-slot-a-mark-2026-11-18.tar`,
+`3466da83…`, the same bytes as before the 11-15 mark) and `write`: `boot_a`
+successful 0 → 1, tries 6, `boot_b` unchanged, both CRCs valid, copies
+identical, `361c9ccc…` (as on 11-15), `sde` read-only again.
+
 `omarchy update` failed with "Cannot fetch updates": the `local` channel's
 `[omamobile]` database is signed with this port's local key, which the build
 trusted only in its own keyring, so on the phone the key was unknown. Also,
