@@ -21,6 +21,13 @@
 #   manual   as systemd, but the RTC is not armed: a key (or a call, an SMS)
 #            has to wake it; the script gives up waiting after SECS
 #
+# CRASH=<remoteproc name> (systemd/manual): report a crash of that remote
+# processor (debugfs, a watchdog: its restart runs as after a real one) just
+# before "systemctl suspend", to test that the sleep hook waits it out.
+# IGNORE_BLOCK=1: "systemctl suspend --check-inhibitors=no", past a block
+# inhibitor held to keep omamobile-sleepd off the phone during a test
+# (delay inhibitors, ModemManager's and NetworkManager's, still apply).
+#
 # Output: /var/log/omamobile/sleep-test/<time>-<mode>.log, with the suspend
 # statistics, the RPMh sleep counters (aosd = the SoC's always-on domain
 # asleep, cxsd = CX collapsed: the deep, low-power state), the CPU cluster's
@@ -92,6 +99,7 @@ health() {
   echo "wlan0: $(cat /sys/class/net/wlan0/operstate 2>/dev/null)"
   echo "usb0: $(cat /sys/class/net/usb0/operstate 2>/dev/null)"
   echo "MM modems: $(mmcli -L 2>/dev/null | grep -c Modem || true)"
+  echo "sleep hook:"; journalctl -t systemd-sleep --since "@${t0%.*}" --no-pager -o cat 2>/dev/null | grep omamobile-hotdog-sleep
 }
 
 say "sleep-once $MODE ${SECS}s on $(uname -r)"
@@ -121,7 +129,14 @@ case $MODE in
   systemd|manual)
     echo 0 > /sys/class/rtc/rtc0/wakealarm
     [[ $MODE == systemd ]] && echo "+$SECS" > /sys/class/rtc/rtc0/wakealarm
-    systemctl suspend; rc=$?
+    if [[ -n ${CRASH:-} ]]; then
+      for r in /sys/class/remoteproc/remoteproc*; do
+        [[ $(cat "$r/name") == "$CRASH" ]] || continue
+        say "reporting a crash of $CRASH (${r##*/})"
+        echo 1 > "/sys/kernel/debug/remoteproc/${r##*/}/crash"
+      done
+    fi
+    if [[ ${IGNORE_BLOCK:-0} == 1 ]]; then systemctl suspend --check-inhibitors=no; else systemctl suspend; fi; rc=$?
     # systemctl returns once logind has queued the sleep: wait for the resume.
     for _ in $(seq $((SECS + 120))); do
       [[ $(cat /sys/power/suspend_stats/success) != "$ok_before" ]] && break

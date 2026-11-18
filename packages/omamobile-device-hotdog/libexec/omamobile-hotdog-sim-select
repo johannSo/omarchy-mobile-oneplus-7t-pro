@@ -40,7 +40,9 @@ select_once() {
   # aborts the sleep: SUSPEND-PLAN S5)
   grep -c "Primary GW: *session doesn't exist" <<<"$status" >/dev/null || return 2
   read -r slot aid < <(first_usim <<<"$status") || true
-  [[ -n ${slot:-} && -n ${aid:-} ]] || return 0
+  # No card with a USIM application (no SIM inserted): nothing to activate,
+  # and nothing will be until a card goes in, so this waits too
+  [[ -n ${slot:-} && -n ${aid:-} ]] || return 2
   if qmi --uim-change-provisioning-session="slot=$slot,activate=yes,session-type=primary-gw-provisioning,aid=$aid" >/dev/null; then
     echo "activated the USIM in slot $slot as the primary subscription"
     sleep 3
@@ -53,12 +55,15 @@ select_once() {
   fi
 }
 
+# --once exits 2 when the next look can wait, otherwise 0
 if [[ ${1:-} == --once ]]; then
   select_once
+  (($? == 2)) && exit 2
   exit 0
 fi
 # Every $interval s until the session exists, then every $idle_interval s
-# (a modem restart drops the session: it is found again within that time)
+# (a modem restart drops the session, and a SIM put in finds no session:
+# either is found within that time). With no SIM, every $idle_interval s.
 idle_interval=${OMAMOBILE_SIM_SELECT_IDLE_INTERVAL:-60}
 while :; do
   select_once
