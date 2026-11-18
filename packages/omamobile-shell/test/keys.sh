@@ -217,7 +217,10 @@ echo false >"$t/locked"; echo true >"$t/dpms"
 darku; [[ ! -s $log ]] || fail "lit and unlocked: dark-unlocked does nothing"
 echo true >"$t/locked"; echo false >"$t/dpms"
 darku; [[ ! -s $log ]] || fail "dark and locked: dark-unlocked does nothing"
-echo "ok - a screen gone dark while unlocked locks, as on Android"
+echo false >"$t/locked"; echo false >"$t/dpms"; mkdir -p "$t/run"; : >"$t/run/omamobile-call-proximity"
+darku; [[ ! -s $log ]] || fail "dark for the ear in a call: dark-unlocked leaves it unlocked"
+rm -f "$t/run/omamobile-call-proximity"
+echo "ok - a screen gone dark while unlocked locks, as on Android, except at the ear in a call"
 
 # A lock slower than the long-press timer (it takes about a second on the
 # phone) must not turn the short press into a long one that wakes the lock.

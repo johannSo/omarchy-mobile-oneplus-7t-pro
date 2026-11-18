@@ -570,6 +570,9 @@ case "${1:-}" in
     # surface takes those touches (derekross/omarchy-mobile#420's review).
     locked && exit 0
     screen_off || exit 0
+    # Dark for the ear in a call (omamobile-call-proximity): stays unlocked,
+    # as on Android; that tool keeps the touchscreen to itself meanwhile.
+    [[ -e ${XDG_RUNTIME_DIR:-/run/user/$UID}/omamobile-call-proximity ]] && exit 0
     omarchy-system-lock
     lock_dark
     ;;
