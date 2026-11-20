@@ -1,0 +1,31 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# omamobile-lock-on-start: lock the session after it starts, like a phone
+# (hypr/phone.lua runs it at login). Only once a PIN is set (Omarchy's
+# lock-on-start toggle): a lock with no password can't be opened.
+#
+# On an encrypted phone the owner has just typed the PIN on the boot's PIN
+# pad, and the initramfs said so in /run/omamobile/disk-unlocked: the first
+# session of that boot is not locked, so the PIN is asked once per power-on
+# (docs/SECURITY-PLAN.md §5.5, D3). A later login in the same boot locks as
+# usual; the boot that was skipped is kept in
+# ~/.local/state/omamobile/disk-unlock-skipped.
+#
+# OMAMOBILE_RUN and OMAMOBILE_BOOT_ID replace /run and the boot's id (tests).
+set -u
+run=${OMAMOBILE_RUN:-/run}
+omarchy-toggle-enabled lock-on-start || exit 0
+if [[ -e $run/omamobile/disk-unlocked ]]; then
+  state=~/.local/state/omamobile/disk-unlock-skipped
+  boot=${OMAMOBILE_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id)}
+  if [[ $(cat "$state" 2>/dev/null) != "$boot" ]]; then
+    mkdir -p "${state%/*}"
+    printf '%s\n' "$boot" > "$state"
+    exit 0
+  fi
+fi
+for _ in $(seq 100); do
+  omarchy-shell lock status >/dev/null 2>&1 && break
+  sleep 0.2
+done
+exec omarchy-system-lock

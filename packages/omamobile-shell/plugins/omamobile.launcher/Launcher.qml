@@ -104,10 +104,159 @@ Item {
     }
   }
 
+  // The A-Z rail along the grid's right edge (on unless turned off in
+  // shell.json): a letter on it shows only that letter's apps. Letter
+  // headers between the apps while browsing are off unless turned on.
+  readonly property bool sectionHeaders: settings.sectionHeaders === true
+  readonly property bool railEnabled: settings.alphabetRail !== false
+  // The rail's letter: the grid shows only the apps under it ("" for all).
+  // A search, Back, the header's Show all, the same letter again or closing
+  // the drawer clears it.
+  property string letterFilter: ""
+  // The drawer's tabs: "linux" (the desktop's apps) and "android" (the ones
+  // Waydroid made entries for), shown while browsing when there are any
+  // Android apps. A tap on a tab, or a sideways swipe on the grid, changes
+  // it; the tab stays for the next open.
+  property string appTab: "linux"
+  readonly property int androidCount: hasQuery ? androidCountBrowsing
+    : LauncherModel.countAndroid(LauncherModel.visibleEntries(apps, hiddenIds, false))
+  // The count while browsing, kept through a search (whose apps are fewer).
+  property int androidCountBrowsing: 0
+  onAndroidCountChanged: if (!hasQuery) androidCountBrowsing = androidCount
+  readonly property bool tabsShown: !hasQuery && androidCount > 0
+  readonly property string shownTab: androidCount > 0 ? appTab : "linux"
+
+  function setTab(tab) {
+    var next = tab === "android" ? "android" : "linux"
+    if (next === appTab) return appTab
+    appTab = next
+    letterFilter = ""
+    return appTab
+  }
+
+  // The apps browsing shows: not hidden, in the tab.
+  function browseEntries() {
+    return LauncherModel.byTab(LauncherModel.visibleEntries(apps, hiddenIds, false), shownTab)
+  }
+
   // ---------------------------------------------------------------- results
 
-  readonly property bool promptMode: LauncherModel.looksLikePrompt(query, apps.length, sentenceWords)
   readonly property bool hasQuery: query.trim().length > 0
+  // Besides apps, a search finds an answer to arithmetic, contacts and
+  // settings (LauncherModel: calculate, matchContacts, matchSettings).
+  readonly property var calcResult: hasQuery ? LauncherModel.calculate(query) : null
+  readonly property var contactMatches: hasQuery ? LauncherModel.matchContacts(contactsIndex, query, 3) : []
+  readonly property var settingMatches: hasQuery ? LauncherModel.matchSettings(settingsIndex, query, 4) : []
+  // Text reads as a prompt once it is a sentence, or when nothing at all
+  // matches it; arithmetic never does.
+  readonly property bool promptMode: !calcResult
+    && LauncherModel.looksLikePrompt(query, apps.length + contactMatches.length + settingMatches.length, sentenceWords)
+  // What Enter does: "agent", "calc", "app", "contact" or "setting"; its
+  // row is highlighted.
+  readonly property string enterTarget: hasQuery
+    ? LauncherModel.enterAction(promptMode, calcResult, apps, contactMatches, settingMatches) : ""
+
+  function entryNameOf(entry) {
+    return appLibrary ? appLibrary.entryName(entry) : String((entry && entry.name) || "")
+  }
+
+  // The drawer's rows for a grid of `columns` (LauncherModel.drawerRows and
+  // searchRows): browsing, the apps not hidden (only the rail's letter's,
+  // when one is chosen; under letter headers, when they are on); in a
+  // search, the answer, every matching app (hidden ones too), contacts and
+  // settings.
+  function rowsFor(columns) {
+    if (hasQuery) return LauncherModel.searchRows(apps, columns, calcResult, contactMatches, settingMatches)
+    var shown = LauncherModel.byLetter(browseEntries(), entryNameOf, letterFilter)
+    return LauncherModel.drawerRows(shown, entryNameOf, columns, sectionHeaders && !letterFilter)
+  }
+
+  // ---------------------------------------------------------------- hidden apps
+
+  // Apps hidden from the drawer (the app menu's Hide): desktop ids, one per
+  // line. A search still finds them, dimmed, and their menu shows them again.
+  readonly property string hiddenPath: Quickshell.env("HOME") + "/.local/state/omamobile/launcher-hidden"
+  property var hiddenIds: ({})
+
+  FileView {
+    path: root.hiddenPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.hiddenIds = LauncherModel.parseIdList(text())
+    onLoadFailed: root.hiddenIds = ({})
+  }
+
+  function setHidden(entry, hidden) {
+    if (!entry || !entry.id) return
+    var next = LauncherModel.withId(hiddenIds, entry.id, hidden)
+    hiddenIds = next
+    // Written whole and moved into place, so the watcher never reads half.
+    Quickshell.execDetached(["sh", "-c", "mkdir -p \"${1%/*}\" && printf %s \"$2\" > \"$1.tmp\" && mv -f \"$1.tmp\" \"$1\"",
+                             "sh", hiddenPath, LauncherModel.idListText(next)])
+  }
+
+  // ---------------------------------------------------------------- search sources
+
+  // Settings (Omarchy's menu rows and the phone's own pages) and contacts
+  // (the address book's vCards), from omamobile-launcher-index, read in
+  // the background as the drawer opens: settings once, again after the
+  // menu files change and every ten minutes, contacts when the last read is
+  // half a minute old.
+  property var settingsIndex: []
+  property var contactsIndex: []
+  property bool settingsStale: true
+  property real contactsReadAt: 0
+
+  property real settingsReadAt: 0
+  function refreshSources() {
+    var now = Date.now()
+    // Some rows depend on the moment (the Wi-Fi QR code needs a network):
+    // read again every ten minutes too.
+    if ((settingsStale || now - settingsReadAt > 600000) && !settingsScan.running) {
+      settingsStale = false
+      settingsReadAt = now
+      settingsScan.running = true
+    }
+    if (now - contactsReadAt > 30000 && !contactsScan.running) {
+      contactsReadAt = now
+      contactsScan.running = true
+    }
+  }
+
+  Process {
+    id: settingsScan
+    command: ["omamobile-launcher-index", "settings"]
+    stdout: SplitParser {
+      onRead: function(line) {
+        try { root.settingsIndex = JSON.parse(line).settings || [] } catch (e) { }
+      }
+    }
+  }
+
+  Process {
+    id: contactsScan
+    command: ["omamobile-launcher-index", "contacts"]
+    stdout: SplitParser {
+      onRead: function(line) {
+        try { root.contactsIndex = JSON.parse(line).contacts || [] } catch (e) { }
+      }
+    }
+  }
+
+  FileView {
+    path: root.omarchyPath + "/default/omarchy/omarchy-menu.jsonc"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.settingsStale = true
+  }
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.config/omarchy/extensions/omarchy-menu.jsonc"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: root.settingsStale = true
+  }
 
   function refreshApps() {
     // sortedEntries() yields ranked rows of { entry, score, ... }; the grid
@@ -124,7 +273,10 @@ Item {
     if (!same) apps = entries
   }
 
-  onQueryChanged: refreshApps()
+  onQueryChanged: {
+    if (query.trim().length > 0) letterFilter = ""
+    refreshApps()
+  }
   onAppLibraryChanged: refreshApps()
 
   Connections {
@@ -146,13 +298,129 @@ Item {
     dismiss()
   }
 
-  // Long-press in the drawer: put the app on the home screen
+  // The app menu's Add to home: put the app on the home screen
   // (omamobile.home), on the page it shows, and go there, as on Android.
   // Through IPC, like the switcher: a plugin only summons its own panels.
   function addToHome(entry) {
     if (!entry) return
+    closeAppMenu()
     Quickshell.execDetached(["qs", "ipc", "-p", Quickshell.shellDir, "call", "shell", "call",
                              "omamobile.home", "addApp", String(entry.id)])
+    dismiss()
+  }
+
+  // A contact found by a search: Phone's dialpad with the number filled in
+  // (it never dials by itself), or with messages, a Messages thread.
+  function openContact(row, messages) {
+    if (!row || !row.number) return
+    Quickshell.execDetached(LauncherModel.contactArgv(row.number, messages))
+    dismiss()
+  }
+
+  // A setting found by a search: its menu row through `omarchy-menu summon`
+  // (a submenu opens, an action runs) or the phone's own page.
+  function openSetting(row) {
+    if (!row || !row.argv || row.argv.length === 0) return
+    Quickshell.execDetached(row.argv)
+    dismiss()
+  }
+
+  // The calculator's answer, to the clipboard, with a toast that says so.
+  function copyResult(calc) {
+    if (!calc) return
+    Quickshell.execDetached(["sh", "-c", "printf %s \"$1\" | wl-copy && exec omarchy-notification-send -g \"$3\" \"$2\"",
+                             "sh", calc.display, "Copied " + calc.display, String.fromCodePoint(0xF00EC)])
+    dismiss()
+  }
+
+  // ---------------------------------------------------------------- app menu
+
+  // A long press on an app opens its menu over the drawer, by the app: its
+  // own shortcuts (the desktop entry's actions), Add to home, Hide or Show
+  // in drawer, App info and Uninstall (asked first). Back, a tap outside or
+  // closing the drawer closes it. menuPage: "main", "info" or "uninstall".
+  property var menuEntry: null
+  property string menuPage: "main"
+  property var menuInfo: null
+  // Where the app's cell is on the sheet: the card opens under it, or above
+  // it when there is no room below.
+  property real menuAnchorX: 0
+  property real menuAnchorY: 0
+  property real menuAnchorH: 0
+
+  function openAppMenu(entry, cell) {
+    if (!entry) return
+    if (cell && typeof cell.mapToItem === "function") {
+      var p = cell.mapToItem(sheet, 0, 0)
+      menuAnchorX = p.x + cell.width / 2
+      menuAnchorY = p.y
+      menuAnchorH = cell.height
+    }
+    menuInfo = null
+    menuPage = "main"
+    menuEntry = entry
+    // A tick as the hold takes, as on Android (feedbackd's profile decides).
+    Quickshell.execDetached(["sh", "-c", "command -v fbcli >/dev/null 2>&1 && exec fbcli -E button-pressed"])
+  }
+
+  function closeAppMenu() {
+    menuEntry = null
+    menuPage = "main"
+    menuInfo = null
+  }
+
+  // Up to four of the entry's own shortcuts (a DesktopAction list).
+  function entryActions(entry) {
+    var out = []
+    var list = entry && entry.actions ? entry.actions : null
+    if (!list) return out
+    for (var i = 0; i < list.length && out.length < 4; i++)
+      if (list[i] && list[i].name) out.push(list[i])
+    return out
+  }
+
+  function runEntryAction(action) {
+    var argv = LauncherModel.actionArgv(action ? action.command : [])
+    closeAppMenu()
+    if (argv.length === 0) return
+    Quickshell.execDetached(argv)
+    dismiss()
+  }
+
+  function toggleHidden(entry) {
+    if (!entry) return
+    setHidden(entry, !hiddenIds[entry.id])
+    closeAppMenu()
+  }
+
+  function showAppInfo() {
+    if (!menuEntry) return
+    menuPage = "info"
+    menuInfo = null
+    appInfoScan.command = ["omamobile-launcher-index", "app-info", String(menuEntry.id)]
+    appInfoScan.running = true
+  }
+
+  Process {
+    id: appInfoScan
+    stdout: SplitParser {
+      onRead: function(line) {
+        try { root.menuInfo = JSON.parse(line) } catch (e) { root.menuInfo = ({}) }
+      }
+    }
+  }
+
+  // Uninstall, once the menu has asked: an Android app through Waydroid,
+  // anything else through Omarchy's own removal (AppLibrary.remove: a web
+  // app, a TUI or the user's own entry is removed, a package or a Flatpak
+  // uninstalled in a terminal that asks for the password).
+  function uninstall(entry) {
+    if (!entry || !entry.id) return
+    var id = String(entry.id)
+    closeAppMenu()
+    if (id.indexOf("waydroid.") === 0) Quickshell.execDetached(["waydroid", "app", "remove", id.slice("waydroid.".length)])
+    else if (appLibrary && typeof appLibrary.remove === "function") appLibrary.remove(id, entryNameOf(entry))
+    else Quickshell.execDetached([omarchyPath + "/bin/omarchy-remove-launcher-entry", id, entryNameOf(entry)])
     dismiss()
   }
 
@@ -169,11 +437,17 @@ Item {
     return "ok"
   }
 
-  // Enter: the agent when the text reads as a prompt, else the top app.
+  // Enter: the agent when the text reads as a prompt, else the highlighted
+  // row: the calculator's answer (copied), the top app, contact or setting.
   function activate() {
     if (!hasQuery) return
-    if (promptMode || apps.length === 0) askAgent(query)
-    else launchApp(apps[0])
+    switch (enterTarget) {
+    case "calc": copyResult(calcResult); break
+    case "app": launchApp(apps[0]); break
+    case "contact": openContact(contactMatches[0], false); break
+    case "setting": openSetting(settingMatches[0]); break
+    default: askAgent(query)
+    }
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -197,6 +471,7 @@ Item {
     var gesture = payload.gesture === true
     query = typeof payload.query === "string" ? payload.query : ""
     refreshApps()
+    refreshSources()
     opened = true
     focusInputOnShow = payload.focus === true
     focusDrawer()
@@ -210,6 +485,8 @@ Item {
   // focus back first, so nothing asks for the keyboard as the drawer goes.
   function close() {
     if (input.activeFocus) sheet.forceActiveFocus()
+    closeAppMenu()
+    letterFilter = ""
     opened = false
     query = ""
     homeSwipe = false
@@ -233,10 +510,46 @@ Item {
   function search(text) {
     if (!opened) expand()
     query = String(text || "")
-    return JSON.stringify({ mode: promptMode ? "agent" : "apps", apps: apps.slice(0, 8).map(function(e) { return e.id }) })
+    return JSON.stringify({ mode: promptMode ? "agent" : "apps", enter: enterTarget, apps: apps.slice(0, 8).map(function(e) { return e.id }),
+                            calc: calcResult ? calcResult.display : null, contacts: contactMatches.length,
+                            settings: settingMatches.map(function(r) { return r.id }) })
   }
 
   function ask(prompt) { return askAgent(prompt) }
+
+  // `shell call omamobile.launcher letter <A-Z or #>`: the drawer with only
+  // that letter's apps, as the rail chooses it ('' for every app).
+  function letter(value) {
+    if (!opened) expand()
+    query = ""
+    letterFilter = String(value || "").trim().toUpperCase().slice(0, 1)
+    return letterFilter || "all"
+  }
+
+  // `shell call omamobile.launcher tab linux|android`: the drawer on that tab.
+  function tab(value) {
+    if (!opened) expand()
+    query = ""
+    return setTab(String(value || ""))
+  }
+
+  // `shell call omamobile.launcher menu <desktop-id>`: that app's menu, in
+  // the middle of the open drawer (for scripts and review shots).
+  function menu(desktopId) {
+    var id = String(desktopId || "")
+    var list = appLibrary ? appLibrary.sortedEntries("") : []
+    for (var i = 0; i < list.length; i++) {
+      var entry = list[i] && list[i].entry
+      if (!entry || entry.id !== id) continue
+      if (!opened) expand()
+      menuAnchorX = sheet.width / 2
+      menuAnchorY = sheet.height / 3
+      menuAnchorH = 0
+      openAppMenu(entry, null)
+      return "ok"
+    }
+    return "no such app"
+  }
 
   function state() {
     return JSON.stringify({
@@ -244,6 +557,13 @@ Item {
       query: query,
       mode: hasQuery ? (promptMode ? "agent" : "apps") : "idle",
       apps: apps.length,
+      hidden: Object.keys(hiddenIds).length,
+      settings: settingsIndex.length,
+      contacts: contactsIndex.length,
+      menu: menuEntry ? String(menuEntry.id) + " " + menuPage : "",
+      letter: letterFilter,
+      tab: shownTab,
+      android: androidCount,
       library: shell && shell.appLibrary ? "host" : (appLibrary ? "local" : "none"),
       agent: agentId,
       command: hasAgent ? LauncherModel.promptArgv("<prompt>") : LauncherModel.PICK_AGENT_ARGV
@@ -265,6 +585,10 @@ Item {
   readonly property int touch: Math.max(44, Style.space(44))
   readonly property int inputHeight: Math.max(48, Style.space(48))
   readonly property int dockHeight: inputHeight + Style.spacing.xxl * 2
+  // A letter header in the list, and a search result's row (a whole touch
+  // target and its two lines).
+  readonly property int sectionHeight: Math.max(28, Style.space(30))
+  readonly property int resultHeight: Math.max(touch + Style.spacing.md, Style.space(56))
   // The dock shows on every empty workspace, under the drawer too: it
   // reserves no space (ExclusionMode.Ignore), so neither its coming and
   // going nor the drawer's opening resizes any window. The home screen keeps
@@ -782,7 +1106,11 @@ Item {
       // After a swipe the sheet has the keyboard focus, not the field (no
       // on-screen keyboard until the field is tapped); typing on a real
       // keyboard still searches, and Escape closes.
-      Keys.onEscapePressed: root.dismiss(0)
+      Keys.onEscapePressed: {
+        if (root.menuEntry) root.closeAppMenu()
+        else if (root.letterFilter) root.letterFilter = ""
+        else root.dismiss(0)
+      }
       Keys.onPressed: function(event) {
         if (!event.text || event.text < " " || (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) return
         input.forceActiveFocus()
@@ -822,7 +1150,10 @@ Item {
               onGrid = !onHeader && at.y >= grid.y && at.y < grid.y + grid.height
               base = 0
               root.pullMoved = false
-              candidate = root.opened && !root.homeSwipe && at.y < searchTop && (!onGrid || !root.hasQuery)
+              // Never under the app menu, nor on the A-Z rail (its drag
+              // picks letters).
+              var onRail = rail.shown && at.x >= rail.x - rail.slop && at.y >= rail.y && at.y < rail.y + rail.height
+              candidate = root.opened && !root.homeSwipe && !root.menuEntry && !onRail && at.y < searchTop && (!onGrid || !grid.fromBottom)
               return
             }
             candidate = false
@@ -872,11 +1203,131 @@ Item {
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
           textFormat: Text.PlainText
-          text: root.hasQuery ? (root.apps.length === 1 ? "1 app" : root.apps.length + " apps") : "Apps"
+          text: root.hasQuery ? LauncherModel.resultsSummary(root.apps.length, root.calcResult, root.contactMatches.length, root.settingMatches.length)
+            : root.letterFilter ? root.letterFilter + " · " + (grid.shownApps === 1 ? "1 app" : grid.shownApps + " apps")
+            : "Apps"
           color: Qt.darker(root.foreground, 1.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.subtitle
           font.bold: true
+        }
+
+        // With a letter chosen on the rail: back to every app.
+        BorderSurface {
+          id: showAll
+          objectName: "showAll"
+          visible: !!root.letterFilter && !root.hasQuery
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: showAllText.implicitWidth + Style.spacing.xl * 2
+          height: Math.max(root.touch - Style.spacing.md, Style.space(36))
+          radius: Style.cornerRadius
+          color: showAllTouch.pressed ? Style.pressedFillFor(root.foreground, Commons.Color.accent) : "transparent"
+          borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
+
+          Text {
+            id: showAllText
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: "Show all"
+            color: root.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          // A whole touch target, a little taller than the chip.
+          MouseArea {
+            id: showAllTouch
+            anchors.fill: parent
+            anchors.topMargin: -Style.spacing.md / 2
+            anchors.bottomMargin: -Style.spacing.md / 2
+            onClicked: root.letterFilter = ""
+          }
+        }
+      }
+
+      // ---------- The tabs: Linux and Android apps, a row of their own
+      // under the header (the handle owns the header's middle).
+      Row {
+        id: tabRow
+        objectName: "drawerTabs"
+        visible: root.tabsShown
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Style.spacing.xxl
+        anchors.rightMargin: Style.spacing.xxl
+        height: visible ? root.touch : 0
+        spacing: Style.spacing.md
+
+        Repeater {
+          model: [{ id: "linux", label: "Linux", glyph: "" }, { id: "android", label: "Android", glyph: "󰀲" }]
+          delegate: BorderSurface {
+            id: tabButton
+            required property var modelData
+            readonly property bool current: root.shownTab === modelData.id
+            objectName: "tab-" + modelData.id
+            width: (tabRow.width - tabRow.spacing) / 2
+            height: tabRow.height
+            radius: Style.cornerRadius
+            color: tabTouch.pressed ? Style.pressedFillFor(root.foreground, Commons.Color.accent)
+              : current ? Commons.Color.menu.selectedBackground : "transparent"
+            borderSpec: current ? Border.flat(Commons.Color.accent, Math.max(1, Style.normalBorderWidth))
+              : Border.controlSpec("normal", root.foreground, Commons.Color.accent)
+
+            Text {
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: tabButton.modelData.glyph + "  " + tabButton.modelData.label
+              color: tabButton.current ? Commons.Color.menu.selectedText : Qt.darker(root.foreground, 1.2)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              font.bold: tabButton.current
+            }
+
+            MouseArea {
+              id: tabTouch
+              anchors.fill: parent
+              onClicked: if (!root.pullMoved) root.setTab(tabButton.modelData.id)
+            }
+          }
+        }
+      }
+
+      // A sideways swipe on the grid changes the tab, as on Android's work
+      // tab: left for Android, right for Linux. Once the finger has gone
+      // sideways the touch is no tap on an app (pullMoved).
+      Item {
+        anchors.fill: parent
+        z: 10
+
+        PointHandler {
+          id: tabSwipe
+          property bool tracking: false
+          property bool sideways: false
+          onActiveChanged: {
+            if (active) {
+              var at = point.pressPosition
+              var searchTop = askRow.visible ? askRow.y : inputRow.y
+              var onRail = rail.shown && at.x >= rail.x - rail.slop
+              tracking = root.opened && root.tabsShown && !root.menuEntry && !onRail && at.y >= grid.y && at.y < searchTop
+              sideways = false
+              return
+            }
+            var dx = point.scenePosition.x - point.scenePressPosition.x
+            if (tracking && sideways && Math.abs(dx) > 60) root.setTab(dx < 0 ? "android" : "linux")
+            tracking = false
+            sideways = false
+          }
+          onPointChanged: {
+            if (!active || !tracking || root.pulling) return
+            var dx = point.scenePosition.x - point.scenePressPosition.x
+            var dy = point.scenePosition.y - point.scenePressPosition.y
+            if (!sideways && Math.abs(dx) > 24 && Math.abs(dx) > 2 * Math.abs(dy)) {
+              sideways = true
+              root.pullMoved = true
+            }
+          }
         }
       }
 
@@ -907,46 +1358,223 @@ Item {
         }
       }
 
-      // ---------- App grid
-      GridView {
+      // ---------- App list: rows of apps under letter headers while
+      // browsing; in a search, the answer, the apps, contacts and settings
+      // (root.rowsFor). A list of rows, not a GridView, so a header or a
+      // result can take a row of its own.
+      ListView {
         id: grid
         objectName: "drawerGrid"
-        anchors.top: header.bottom
+        anchors.top: tabRow.visible ? tabRow.bottom : header.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: askRow.visible ? askRow.top : inputRow.top
         anchors.leftMargin: Style.spacing.lg
-        anchors.rightMargin: Style.spacing.lg
+        // The rail takes its own strip at the right, so it covers no app.
+        anchors.rightMargin: Style.spacing.lg + (rail.shown ? rail.width : 0)
         anchors.bottomMargin: Style.spacing.lg
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         // Still while a finger pulls the drawer.
         interactive: !root.pulling
         // While searching, results stack up from the input so the best match
-        // sits nearest the thumb; the full list reads top-down.
-        verticalLayoutDirection: root.hasQuery ? GridView.BottomToTop : GridView.TopToBottom
-        cellWidth: Math.floor(width / root.drawerColumns(width))
-        cellHeight: Math.max(96, Style.space(100))
-        model: root.apps
+        // sits nearest the thumb, and so do a rail letter's few apps; the
+        // full list reads top-down.
+        readonly property bool fromBottom: root.hasQuery || !!root.letterFilter
+        verticalLayoutDirection: fromBottom ? ListView.BottomToTop : ListView.TopToBottom
+        readonly property int columns: root.drawerColumns(width)
+        readonly property real cellWidth: Math.floor(width / root.drawerColumns(width))
+        readonly property real cellHeight: Math.max(96, Style.space(100))
+        model: root.rowsFor(columns)
+        // The apps the rows hold (the header's count under a letter).
+        readonly property int shownApps: {
+          var n = 0
+          var rows = model || []
+          for (var i = 0; i < rows.length; i++) if (rows[i].kind === "apps") n += rows[i].entries.length
+          return n
+        }
         opacity: root.promptMode ? 0.5 : 1
+        Behavior on opacity { NumberAnimation { duration: 120 } }
 
-        delegate: AppCell {
+        delegate: Item {
+          id: listRow
           required property var modelData
           required property int index
-          width: grid.cellWidth
-          height: grid.cellHeight
-          entry: modelData
-          highlighted: index === 0 && root.hasQuery && !root.promptMode
-          onTapped: root.launchApp(modelData)
-          onHeld: root.addToHome(modelData)
+          readonly property string kind: modelData ? String(modelData.kind) : ""
+          width: grid.width
+          height: kind === "apps" ? grid.cellHeight : kind === "header" ? root.sectionHeight : root.resultHeight
+
+          Row {
+            visible: listRow.kind === "apps"
+            Repeater {
+              model: listRow.kind === "apps" ? listRow.modelData.entries : []
+              delegate: AppCell {
+                id: appCell
+                required property var modelData
+                width: grid.cellWidth
+                height: grid.cellHeight
+                entry: modelData
+                dimmed: !!root.hiddenIds[modelData.id]
+                highlighted: root.enterTarget === "app" && modelData === root.apps[0]
+                onTapped: root.launchApp(modelData)
+                onHeld: root.openAppMenu(modelData, appCell)
+              }
+            }
+          }
+
+          Loader {
+            anchors.fill: parent
+            active: listRow.kind === "header"
+            sourceComponent: SectionHeader { text: listRow.modelData.label }
+          }
+
+          Loader {
+            anchors.fill: parent
+            active: listRow.kind === "calc" || listRow.kind === "contact" || listRow.kind === "setting"
+            sourceComponent: ResultRow {
+              row: listRow.modelData
+              highlighted: root.enterTarget === listRow.kind
+                && (listRow.kind === "calc"
+                    || (listRow.kind === "contact" && root.contactMatches.length > 0 && listRow.modelData.number === root.contactMatches[0].number)
+                    || (listRow.kind === "setting" && root.settingMatches.length > 0 && listRow.modelData.id === root.settingMatches[0].id))
+              onTapped: {
+                if (listRow.kind === "calc") root.copyResult(listRow.modelData)
+                else if (listRow.kind === "contact") root.openContact(listRow.modelData, false)
+                else root.openSetting(listRow.modelData)
+              }
+              onSecondary: root.openContact(listRow.modelData, true)
+            }
+          }
+        }
+      }
+
+      // ---------- The A-Z rail: the letters the apps start with, along the
+      // grid's right edge while browsing. A touch on a letter, or a drag
+      // along the rail, shows only that letter's apps (root.letterFilter);
+      // the letter under the finger shows large in a bubble beside it. The
+      // letter stays chosen when the finger lifts; a tap on it again (or
+      // Show all, or Back) shows every app.
+      Item {
+        id: rail
+        objectName: "drawerRail"
+        readonly property var letters: root.hasQuery ? [] : LauncherModel.appLetters(root.browseEntries(), root.entryNameOf)
+        readonly property bool shown: root.railEnabled && !root.hasQuery && letters.length > 1
+        // Its strip is narrow; the touch reaches a little into the grid's
+        // margin, so the target is about a finger wide.
+        readonly property int slop: Style.spacing.lg
+        // The letter under the finger while it is down.
+        property string current: ""
+        // What was chosen when the finger came down, and whether it moved
+        // to another letter since: a tap on the chosen letter clears it.
+        property string atPress: ""
+        property bool moved: false
+        visible: shown
+        anchors.right: parent.right
+        anchors.rightMargin: Style.spacing.xs
+        anchors.top: grid.top
+        anchors.bottom: grid.bottom
+        width: Math.max(28, Style.space(28))
+
+        // Each letter's share of the height, no taller than a readable step.
+        readonly property real step: letters.length > 0 ? Math.min(Math.max(16, Style.space(20)), height / letters.length) : 0
+
+        Column {
+          id: railColumn
+          anchors.centerIn: parent
+          Repeater {
+            model: rail.letters
+            delegate: Item {
+              required property var modelData
+              readonly property bool chosen: (rail.current || root.letterFilter) === modelData.letter
+              width: rail.width
+              height: rail.step
+
+              // The chosen letter sits on an accent dot.
+              Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width, parent.height) - 2
+                height: width
+                radius: width / 2
+                visible: parent.chosen
+                color: Commons.Color.accent
+              }
+
+              Text {
+                anchors.fill: parent
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                textFormat: Text.PlainText
+                text: modelData.letter
+                color: parent.chosen ? Commons.Color.menu.background : Qt.darker(root.foreground, 1.5)
+                font.family: Style.font.family
+                font.pixelSize: Math.min(Readable.px(Style.font.caption), rail.step * 0.8)
+                font.bold: parent.chosen
+              }
+            }
+          }
+        }
+
+        function letterAt(y) {
+          var i = LauncherModel.railPick(y - railColumn.y, railColumn.height, letters.length)
+          return i < 0 ? "" : letters[i].letter
+        }
+
+        function pick(y) {
+          var letter = letterAt(y)
+          if (!letter || letter === current) return
+          if (current) moved = true
+          current = letter
+          root.letterFilter = letter
+          grid.positionViewAtBeginning()
+        }
+
+        MouseArea {
+          id: railTouch
+          anchors.fill: parent
+          anchors.leftMargin: -rail.slop
+          preventStealing: true
+          onPressed: function(mouse) {
+            rail.atPress = root.letterFilter
+            rail.moved = false
+            rail.current = ""
+            rail.pick(mouse.y)
+          }
+          onPositionChanged: function(mouse) { if (pressed) rail.pick(mouse.y) }
+          onReleased: {
+            if (!rail.moved && rail.current && rail.current === rail.atPress) root.letterFilter = ""
+            rail.current = ""
+          }
+          onCanceled: rail.current = ""
+        }
+
+        // The letter under the finger, large, left of the rail.
+        Rectangle {
+          objectName: "railBubble"
+          visible: railTouch.pressed && rail.current !== ""
+          width: Math.max(56, Style.space(60))
+          height: width
+          radius: width / 2
+          x: -width - Style.spacing.xl
+          y: Math.max(0, Math.min(rail.height - height, railTouch.mouseY - height / 2))
+          color: Commons.Color.accent
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: rail.current
+            color: Commons.Color.menu.background
+            font.family: Style.font.family
+            font.pixelSize: Style.font.display
+            font.bold: true
+          }
         }
       }
 
       Text {
         anchors.centerIn: grid
-        visible: root.hasQuery && root.apps.length === 0
+        visible: root.hasQuery && grid.count === 0
         textFormat: Text.PlainText
-        text: "No apps match"
+        text: "Nothing matches"
         color: Qt.darker(root.foreground, 1.6)
         font.family: Style.font.family
         font.pixelSize: Style.font.body
@@ -1075,7 +1703,9 @@ Item {
           Keys.onReturnPressed: root.activate()
           Keys.onEnterPressed: root.activate()
           Keys.onEscapePressed: {
-            if (root.query) root.query = ""
+            if (root.menuEntry) root.closeAppMenu()
+            else if (root.letterFilter) root.letterFilter = ""
+            else if (root.query) root.query = ""
             else root.dismiss()
           }
 
@@ -1088,6 +1718,280 @@ Item {
             color: root.promptMode ? Commons.Color.accent : Qt.darker(root.foreground, 1.3)
             font.family: Style.font.family
             font.pixelSize: Style.font.iconLarge
+          }
+        }
+      }
+
+      // ---------- The app menu: a card by the app a long press chose, over
+      // a scrim that closes it. Its pages: the menu, the app's info, and the
+      // question before Uninstall.
+      Item {
+        id: appMenu
+        objectName: "appMenu"
+        anchors.fill: parent
+        z: 20
+        visible: root.menuEntry !== null
+        onVisibleChanged: if (visible) menuReveal.restart()
+
+        // The drawer fades back under the card.
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(Commons.Color.menu.background, 0.75)
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.closeAppMenu()
+        }
+
+        BorderSurface {
+          id: menuCard
+          objectName: "appMenuCard"
+          readonly property real margin: Style.spacing.xl
+          width: Math.min(parent.width - margin * 2, Math.max(280, Style.space(320)))
+          height: menuColumn.implicitHeight + contentTopInset + contentBottomInset
+          x: Math.round(Math.max(margin, Math.min(parent.width - width - margin, root.menuAnchorX - width / 2)))
+          // Under the app when it fits, else above it, else as low as fits.
+          y: {
+            var below = root.menuAnchorY + root.menuAnchorH
+            if (below + height <= parent.height - margin) return Math.round(below)
+            var above = root.menuAnchorY - height
+            if (above >= margin) return Math.round(above)
+            return Math.round(Math.max(margin, parent.height - height - margin))
+          }
+          transformOrigin: Item.Top
+          color: Commons.Color.popups.background
+          borderSpec: Border.surfaceSpec("popups", "border", Commons.Color.popups.border, Math.max(1, Style.space(2)))
+          radius: Style.cornerRadius
+          padding: Style.spacing.md
+
+          // A tap on the card is the card's, never the scrim's.
+          MouseArea { anchors.fill: parent }
+
+          ParallelAnimation {
+            id: menuReveal
+            NumberAnimation { target: menuCard; property: "opacity"; from: 0; to: 1; duration: 120; easing.type: Easing.OutCubic }
+            NumberAnimation { target: menuCard; property: "scale"; from: 0.94; to: 1; duration: 140; easing.type: Easing.OutCubic }
+          }
+
+          Column {
+            id: menuColumn
+            x: menuCard.contentLeftInset
+            y: menuCard.contentTopInset
+            width: menuCard.width - menuCard.contentLeftInset - menuCard.contentRightInset
+
+            // The app: its icon, name and what it is.
+            Item {
+              width: parent.width
+              height: Math.max(root.touch, Style.space(52))
+
+              Image {
+                id: menuIcon
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.md
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(32, Style.space(36))
+                height: width
+                fillMode: Image.PreserveAspectFit
+                sourceSize.width: width * Screen.devicePixelRatio
+                sourceSize.height: height * Screen.devicePixelRatio
+                source: root.appLibrary && root.menuEntry ? root.appLibrary.iconSource(root.menuEntry.icon) : ""
+              }
+
+              Column {
+                anchors.left: menuIcon.right
+                anchors.leftMargin: Style.spacing.lg
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.md
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.spacing.xxs
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: root.menuEntry ? root.entryNameOf(root.menuEntry) : ""
+                  color: Commons.Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.subtitle
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  visible: text.length > 0
+                  textFormat: Text.PlainText
+                  text: !root.menuEntry ? ""
+                    : root.hiddenIds[root.menuEntry.id] ? "Hidden from the drawer"
+                    : String(root.menuEntry.genericName || root.menuEntry.comment || "")
+                  color: Qt.darker(Commons.Color.popups.text, 1.4)
+                  font.family: Style.font.family
+                  font.pixelSize: Readable.px(Style.font.caption)
+                  elide: Text.ElideRight
+                }
+              }
+            }
+
+            Rectangle {
+              width: parent.width
+              height: 1
+              color: Util.alpha(Commons.Color.popups.text, 0.12)
+            }
+
+            // ---- The menu
+            Column {
+              width: parent.width
+              visible: root.menuPage === "main"
+
+              Repeater {
+                model: root.menuPage === "main" ? root.entryActions(root.menuEntry) : []
+                delegate: MenuRow {
+                  required property var modelData
+                  width: parent.width
+                  glyph: "󰁔"
+                  label: modelData.name
+                  onClicked: root.runEntryAction(modelData)
+                }
+              }
+
+              MenuRow {
+                objectName: "menuAddToHome"
+                width: parent.width
+                glyph: "󰋜"
+                label: "Add to home"
+                onClicked: root.addToHome(root.menuEntry)
+              }
+
+              MenuRow {
+                objectName: "menuHide"
+                width: parent.width
+                readonly property bool hidden: !!root.menuEntry && !!root.hiddenIds[root.menuEntry.id]
+                glyph: hidden ? "󰈈" : "󰈉"
+                label: hidden ? "Show in drawer" : "Hide from drawer"
+                onClicked: root.toggleHidden(root.menuEntry)
+              }
+
+              MenuRow {
+                objectName: "menuInfo"
+                width: parent.width
+                glyph: "󰋽"
+                label: "App info"
+                onClicked: root.showAppInfo()
+              }
+
+              MenuRow {
+                objectName: "menuUninstall"
+                width: parent.width
+                glyph: "󰆴"
+                label: "Uninstall"
+                danger: true
+                onClicked: root.menuPage = "uninstall"
+              }
+            }
+
+            // ---- App info
+            Column {
+              width: parent.width
+              visible: root.menuPage === "info"
+              topPadding: Style.spacing.md
+              bottomPadding: Style.spacing.xs
+              spacing: Style.spacing.sm
+
+              Text {
+                visible: root.menuInfo === null
+                x: Style.spacing.md
+                textFormat: Text.PlainText
+                text: "Reading…"
+                color: Qt.darker(Commons.Color.popups.text, 1.4)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+              }
+
+              Repeater {
+                model: root.menuInfo ? [
+                  ["Source", root.menuInfo.source],
+                  ["Package", root.menuInfo.package],
+                  ["Version", root.menuInfo.version],
+                  ["Size", root.menuInfo.size],
+                  ["Runs", root.menuInfo.exec],
+                  ["Entry", root.menuInfo.file || root.menuInfo.id]
+                ].filter(function(pair) { return pair[1] }) : []
+                delegate: Column {
+                  required property var modelData
+                  x: Style.spacing.md
+                  width: parent.width - Style.spacing.md * 2
+                  spacing: Style.spacing.xxs
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData[0]
+                    color: Qt.darker(Commons.Color.popups.text, 1.4)
+                    font.family: Style.font.family
+                    font.pixelSize: Readable.px(Style.font.caption)
+                  }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: String(modelData[1])
+                    color: Commons.Color.popups.text
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.body
+                    wrapMode: Text.WrapAnywhere
+                    maximumLineCount: 3
+                    elide: Text.ElideRight
+                  }
+                }
+              }
+
+              MenuRow {
+                width: parent.width
+                glyph: "󰁍"
+                label: "Back"
+                onClicked: root.menuPage = "main"
+              }
+            }
+
+            // ---- Uninstall: asked first
+            Column {
+              width: parent.width
+              visible: root.menuPage === "uninstall"
+              topPadding: Style.spacing.lg
+              spacing: Style.spacing.lg
+
+              Text {
+                x: Style.spacing.md
+                width: parent.width - Style.spacing.md * 2
+                textFormat: Text.PlainText
+                text: root.menuEntry
+                  ? (String(root.menuEntry.id).indexOf("waydroid.") === 0
+                     ? "Uninstall " + root.entryNameOf(root.menuEntry) + " from Android?"
+                     : "Uninstall " + root.entryNameOf(root.menuEntry) + "? A package asks for your password in a terminal.")
+                  : ""
+                color: Commons.Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                wrapMode: Text.Wrap
+              }
+
+              Row {
+                anchors.right: parent.right
+                spacing: Style.spacing.md
+
+                MenuButton {
+                  objectName: "uninstallCancel"
+                  label: "Cancel"
+                  onClicked: root.menuPage = "main"
+                }
+
+                MenuButton {
+                  objectName: "uninstallConfirm"
+                  label: "Uninstall"
+                  danger: true
+                  onClicked: root.uninstall(root.menuEntry)
+                }
+              }
+            }
           }
         }
       }
@@ -1268,13 +2172,15 @@ Item {
     }
   }
 
-  // One app in the grid: icon over a two-line name.
+  // One app in the grid: icon over a two-line name. The icon dips a little
+  // under the finger; a hidden app (found by a search) is dimmed.
   component AppCell: Item {
     id: cell
 
     property var entry: null
     objectName: "app-" + (entry ? entry.id : "")
     property bool highlighted: false
+    property bool dimmed: false
     signal tapped()
     signal held()
 
@@ -1296,6 +2202,9 @@ Item {
       height: width
       fillMode: Image.PreserveAspectFit
       asynchronous: true
+      opacity: cell.dimmed ? 0.45 : 1
+      scale: cellTouch.pressed && !root.pullMoved ? 0.9 : 1
+      Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
       // Decode at physical pixels so PNG icons stay sharp at scale 3.
       sourceSize.width: width * Screen.devicePixelRatio
       sourceSize.height: height * Screen.devicePixelRatio
@@ -1311,8 +2220,9 @@ Item {
       anchors.rightMargin: Style.spacing.sm
       horizontalAlignment: Text.AlignHCenter
       textFormat: Text.PlainText
-      text: root.appLibrary && cell.entry ? root.appLibrary.entryName(cell.entry) : ""
+      text: cell.entry ? root.entryNameOf(cell.entry) : ""
       color: cell.highlighted ? Commons.Color.menu.selectedText : root.foreground
+      opacity: cell.dimmed ? 0.6 : 1
       font.family: Style.font.family
       font.pixelSize: Readable.px(Style.font.caption)
       wrapMode: Text.Wrap
@@ -1323,9 +2233,215 @@ Item {
     MouseArea {
       id: cellTouch
       anchors.fill: parent
+      // A hold about as long as Android's opens the app's menu.
+      pressAndHoldInterval: 450
       // Not when the touch pulled the drawer down instead.
       onClicked: if (!root.pullMoved) cell.tapped()
       onPressAndHold: if (!root.pullMoved) cell.held()
+    }
+  }
+
+  // A letter (or a search's group) over the rows it heads.
+  component SectionHeader: Item {
+    property string text: ""
+    objectName: "section-" + text
+
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.spacing.md
+      anchors.bottom: parent.bottom
+      anchors.bottomMargin: Style.spacing.xxs
+      textFormat: Text.PlainText
+      text: parent.text
+      color: Commons.Color.accent
+      font.family: Style.font.family
+      font.pixelSize: Readable.px(Style.font.caption)
+      font.bold: true
+    }
+  }
+
+  // A search result that isn't an app: the calculator's answer (tap to
+  // copy), a contact (tap for the dialpad, the bubble for Messages) or a
+  // setting (tap to open). row is the list's row (LauncherModel.searchRows).
+  component ResultRow: Item {
+    id: result
+    property var row: ({})
+    property bool highlighted: false
+    readonly property string kind: row ? String(row.kind) : ""
+    objectName: "result-" + kind
+    signal tapped()
+    signal secondary()
+
+    BorderSurface {
+      anchors.fill: parent
+      anchors.margins: Style.spacing.xs
+      radius: Style.cornerRadius
+      color: resultTouch.pressed ? Style.pressedFillFor(root.foreground, Commons.Color.accent)
+        : result.highlighted ? Commons.Color.menu.selectedBackground : "transparent"
+      borderSpec: result.highlighted ? Border.flat(Commons.Color.accent, Math.max(1, Style.normalBorderWidth)) : Border.none()
+    }
+
+    MouseArea {
+      id: resultTouch
+      anchors.fill: parent
+      onClicked: if (!root.pullMoved) result.tapped()
+    }
+
+    Text {
+      id: resultGlyph
+      anchors.left: parent.left
+      anchors.leftMargin: Style.spacing.xl
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.font.display
+      horizontalAlignment: Text.AlignHCenter
+      textFormat: Text.PlainText
+      text: result.kind === "calc" ? "󰃬" : result.kind === "contact" ? "󰀄" : (result.row.icon || "󰒓")
+      color: result.highlighted ? Commons.Color.menu.selectedText : Commons.Color.accent
+      font.family: result.kind === "setting" && result.row.iconFont ? result.row.iconFont : Style.font.family
+      font.pixelSize: Style.font.iconLarge
+    }
+
+    Column {
+      anchors.left: resultGlyph.right
+      anchors.leftMargin: Style.spacing.xl
+      anchors.right: messageKey.visible ? messageKey.left : parent.right
+      anchors.rightMargin: Style.spacing.lg
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.spacing.xxs
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: result.kind === "calc" ? "= " + result.row.display
+          : result.kind === "contact" ? result.row.name : String(result.row.label || "")
+        color: result.highlighted ? Commons.Color.menu.selectedText : root.foreground
+        font.family: Style.font.family
+        font.pixelSize: result.kind === "calc" ? Style.font.title : Style.font.subtitle
+        font.bold: true
+        elide: Text.ElideRight
+      }
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: result.kind === "calc" ? result.row.expression + " · tap to copy"
+          : result.kind === "contact" ? [result.row.label, result.row.number].filter(function(v) { return v }).join(" · ")
+          : (result.row.path ? "Settings › " + result.row.path : "Settings")
+        color: Qt.darker(root.foreground, 1.4)
+        font.family: Style.font.family
+        font.pixelSize: Readable.px(Style.font.caption)
+        elide: Text.ElideRight
+      }
+    }
+
+    // A contact's Messages key: a whole touch target at the row's end.
+    Item {
+      id: messageKey
+      objectName: "resultMessage"
+      visible: result.kind === "contact"
+      anchors.right: parent.right
+      anchors.rightMargin: Style.spacing.xs
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.touch
+      height: root.touch
+
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: "󰍡"
+        color: messageTouch.pressed ? Commons.Color.accent : root.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.iconLarge
+      }
+
+      MouseArea {
+        id: messageTouch
+        anchors.fill: parent
+        onClicked: if (!root.pullMoved) result.secondary()
+      }
+    }
+  }
+
+  // A row of the app menu: a glyph and a label, a whole touch target.
+  component MenuRow: Item {
+    id: menuRow
+    property string glyph: ""
+    property string label: ""
+    property bool danger: false
+    signal clicked()
+    height: Math.max(root.touch, Style.space(48))
+    readonly property color tint: danger ? Commons.Color.urgent : Commons.Color.popups.text
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: menuRowTouch.pressed ? Util.alpha(menuRow.tint, 0.14) : "transparent"
+    }
+
+    Text {
+      id: menuRowGlyph
+      anchors.left: parent.left
+      anchors.leftMargin: Style.spacing.md
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.font.display
+      horizontalAlignment: Text.AlignHCenter
+      textFormat: Text.PlainText
+      text: menuRow.glyph
+      color: menuRow.danger ? Commons.Color.urgent : Commons.Color.accent
+      font.family: Style.font.family
+      font.pixelSize: Style.font.iconLarge
+    }
+
+    Text {
+      anchors.left: menuRowGlyph.right
+      anchors.leftMargin: Style.spacing.lg
+      anchors.right: parent.right
+      anchors.rightMargin: Style.spacing.md
+      anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
+      text: menuRow.label
+      color: menuRow.tint
+      font.family: Style.font.family
+      font.pixelSize: Style.font.body
+      elide: Text.ElideRight
+    }
+
+    MouseArea {
+      id: menuRowTouch
+      anchors.fill: parent
+      onClicked: menuRow.clicked()
+    }
+  }
+
+  // The question's answers: a framed button, a whole touch target.
+  component MenuButton: BorderSurface {
+    id: menuButton
+    property string label: ""
+    property bool danger: false
+    signal clicked()
+    width: Math.max(root.touch * 2, buttonText.implicitWidth + Style.spacing.xl * 2)
+    height: Math.max(root.touch, Style.space(44))
+    radius: Style.cornerRadius
+    color: buttonTouch.pressed ? Style.pressedFillFor(root.foreground, Commons.Color.accent)
+      : danger ? Commons.Color.urgent : "transparent"
+    borderSpec: danger ? Border.flat(Commons.Color.urgent, Math.max(1, Style.normalBorderWidth))
+      : Border.controlSpec("normal", Commons.Color.popups.text, Commons.Color.accent)
+
+    Text {
+      id: buttonText
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: menuButton.label
+      color: menuButton.danger ? Commons.Color.popups.background : Commons.Color.popups.text
+      font.family: Style.font.family
+      font.pixelSize: Style.font.body
+      font.bold: menuButton.danger
+    }
+
+    MouseArea {
+      id: buttonTouch
+      anchors.fill: parent
+      onClicked: menuButton.clicked()
     }
   }
 }
