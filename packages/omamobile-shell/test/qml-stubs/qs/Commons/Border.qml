@@ -7,5 +7,6 @@ QtObject {
   function flat(color, width) { return { color: color, width: width } }
   function controlSpec(state, foreground, accent) { return { state: state } }
   function none() { return {} }
+  function surfaceSpec(section, token, color, width) { return { color: color, width: width } }
   function left(spec) { return 0 }
 }

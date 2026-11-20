@@ -77,12 +77,9 @@ hl.window_rule({
 
 -- Lock after boot, like a phone: the session logs in automatically, then
 -- Omarchy's lock comes up with its PIN pad. Only once a PIN is set (the
--- lock-on-start toggle), since a lock with no password can't be opened.
-o.launch_on_start(
-  "bash -c 'omarchy-toggle-enabled lock-on-start || exit 0; "
-    .. "for _ in $(seq 100); do omarchy-shell lock status >/dev/null 2>&1 && break; sleep 0.2; done; "
-    .. "omarchy-system-lock'"
-)
+-- lock-on-start toggle), since a lock with no password can't be opened, and
+-- not right after an encrypted phone's PIN pad has just taken the PIN.
+o.launch_on_start("omamobile-lock-on-start")
 
 -- Hardware keys, like Android: a short power press locks and turns the
 -- screen off (or wakes a locked phone), holding power opens Omarchy's system

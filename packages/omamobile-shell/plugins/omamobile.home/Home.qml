@@ -77,7 +77,7 @@ Item {
   property string notice: ""
   // The item removed last, as findItem saw it, while its Undo chip shows.
   property var undoRemoved: null
-  readonly property bool wantsKeyboard: sheet === "apps" || sheet === "settings" || sheet === "create" || owlTyping
+  readonly property bool wantsKeyboard: sheet === "apps" || sheet === "settings" || sheet === "create" || sheet === "folder" || owlTyping
 
   // Bumped when desktop entries change, so app tiles look themselves up again.
   property int appsRevision: 0
@@ -1031,7 +1031,7 @@ Item {
     commit(HomeModel.removeItem(layout, id))
     if (settingsId === id) { sheet = ""; settingsId = "" }
     undoRemoved = found
-    notice = found.item.kind === "app" ? "App removed" : "Widget removed"
+    notice = found.item.kind === "app" ? "App removed" : found.item.kind === "folder" ? "Folder removed" : "Widget removed"
     noticeTimer.interval = 5000
     noticeTimer.restart()
   }
@@ -1056,6 +1056,51 @@ Item {
     commit(next)
     var found = HomeModel.findItem(next, id)
     if (found && found.page !== currentPage) goToPage(found.page, true)
+  }
+
+  // ---------------------------------------------------------------- folders
+
+  // The folder the folder sheet shows.
+  property string folderId: ""
+
+  // An app dropped onto an app (a new folder, opened so it can be named) or
+  // onto a folder (added to it).
+  function dropOnto(dragId, targetId) {
+    var kind = HomeModel.dropKind(layout, dragId, targetId)
+    if (!kind) return ""
+    var next = HomeModel.dropOnto(layout, dragId, targetId)
+    commit(next)
+    if (kind === "folder") openFolder(next.folder)
+    else flash("Added to the folder")
+    return next.folder
+  }
+
+  function openFolder(id) {
+    var found = HomeModel.findItem(layout, String(id))
+    if (!found || found.item.kind !== "folder") return "none"
+    folderId = found.item.id
+    sheet = "folder"
+    return folderId
+  }
+
+  function renameFolder(id, name) {
+    commit(HomeModel.renameFolder(layout, String(id), name))
+  }
+
+  // Out of the folder onto its page; the sheet closes when the folder went
+  // with it (one app left: the app again).
+  function takeOutOfFolder(id, appId) {
+    var next = HomeModel.takeOutOfFolder(layout, String(id), appId)
+    if (!next.placed) { flash("No room for that"); return "full" }
+    commit(next)
+    var still = HomeModel.findItem(next, String(id))
+    if (!still || still.item.kind !== "folder") { sheet = ""; folderId = "" }
+    flash("Moved to the home screen")
+    return next.placed.id
+  }
+
+  function launchFromFolder(appId) {
+    if (launch(appId)) { sheet = ""; folderId = "" }
   }
 
   function resizeItem(id, w, h) {
@@ -1110,6 +1155,8 @@ Item {
   function page(n) { goToPage(Number(n), true); return String(currentPage) }
   function edit(on) { return String(on) === "off" || String(on) === "false" ? (setEditing(false), "done") : requestEdit() }
   function addApp(appId) { return addAppHere(String(appId || "")) }
+  // `shell call omamobile.home folder <id>`: open that folder.
+  function folder(id) { return openFolder(id) }
   function addWidget(type) {
     var t = String(type)
     return HomeModel.widgetSpec(t, userCatalog) || HomeModel.isUserType(t) ? addWidgetHere(t) : "unknown"
@@ -1470,15 +1517,32 @@ Item {
     }
 
     Rectangle {
+      objectName: "dropPreview"
       visible: !!page.preview
       x: page.preview ? page.preview.x * page.cellW + root.gap : 0
       y: page.preview ? page.preview.y * page.cellH + root.gap : 0
       width: page.preview ? page.preview.w * page.cellW - root.gap * 2 : 0
       height: page.preview ? page.preview.h * page.cellH - root.gap * 2 : 0
       radius: Style.cornerRadius
-      color: Util.alpha(Commons.Color.accent, 0.22)
-      border.width: 2
+      color: Util.alpha(Commons.Color.accent, page.preview && page.preview.onto ? 0.4 : 0.22)
+      border.width: page.preview && page.preview.onto ? 3 : 2
       border.color: Commons.Color.accent
+
+      // Over an app or a folder: what letting go does.
+      Text {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Style.spacing.xs
+        visible: !!(page.preview && page.preview.onto)
+        textFormat: Text.PlainText
+        text: page.preview && page.preview.folder === "add" ? "Add to folder" : "New folder"
+        color: root.foreground
+        style: Text.Outline
+        styleColor: Util.alpha(Commons.Color.menu.background, 0.85)
+        font.family: Style.font.family
+        font.pixelSize: Readable.px(Style.font.caption + 2)
+        font.bold: true
+      }
     }
 
     Repeater {
@@ -1557,6 +1621,7 @@ Item {
       source: (cell.isUser && root.isOwlType(cell.modelData.type)) || HomeModel.isOwlType(cell.modelData.type) ? Qt.resolvedUrl("OwlCell.qml")
         : cell.isUser ? Qt.resolvedUrl("UserWidgetCell.qml")
         : cell.isWidget ? Qt.resolvedUrl(cell.modelData.type.charAt(0).toUpperCase() + cell.modelData.type.slice(1) + "Widget.qml")
+        : cell.modelData.kind === "folder" ? Qt.resolvedUrl("FolderTile.qml")
         : Qt.resolvedUrl("AppTile.qml")
       onLoaded: {
         item.home = root
@@ -1602,9 +1667,13 @@ Item {
           cell.owner.preview = null
           cell.dragging = false
           cell.dragX = 0; cell.dragY = 0
-          root.moveItem(cell.modelData.id, t.page, t.x, t.y)
+          // An app let go on an app makes a folder, on a folder joins it.
+          if (t.onto) root.dropOnto(cell.modelData.id, t.onto)
+          else root.moveItem(cell.modelData.id, t.page, t.x, t.y)
         } else if (cell.isWidget) {
           root.openSettings(cell.modelData.id)
+        } else if (cell.modelData.kind === "folder") {
+          root.openFolder(cell.modelData.id)
         }
       }
       onCanceled: { cell.dragging = false; cell.dragX = 0; cell.dragY = 0; cell.owner.preview = null }
@@ -1620,7 +1689,13 @@ Item {
       var p = owner.index + shift
       if (p < 0) { p = 0; shift = 0 }
       if (shift !== 0) cellAt.x = shift < 0 ? grid.columns - modelData.w : 0
-      return { page: p, x: cellAt.x, y: cellAt.y, w: modelData.w, h: modelData.h, shift: shift }
+      // An app over another app or a folder on this page: the folder drop
+      // (HomeModel.dropKind says whether it can).
+      var under = shift === 0 && modelData.kind === "app" && root.viewLayout.pages[p]
+        ? HomeModel.itemAtCell(root.viewLayout.pages[p].items, cellAt.x, cellAt.y, modelData.id) : null
+      var onto = under && HomeModel.dropKind(root.layout, modelData.id, under.id) ? under.id : ""
+      return { page: p, x: cellAt.x, y: cellAt.y, w: modelData.w, h: modelData.h, shift: shift, onto: onto,
+               folder: onto ? (under.kind === "folder" ? "add" : "new") : "" }
     }
 
     // Remove.

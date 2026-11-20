@@ -159,8 +159,420 @@ function speedOf(samples, now) {
   return dt >= 8 ? (b.pos - a.pos) / dt * 1000 : 0
 }
 
+// ---------------------------------------------------------------- the list
+//
+// The drawer is a list of rows: app rows (one cell per column), letter
+// headers while browsing, and in a search the calculator, contacts and
+// settings that match. Each row is { kind, ... }:
+//   { kind: "header", label, letter }
+//   { kind: "apps", entries: [entry...], start: index of entries[0], letter }
+//   { kind: "calc", expression, value, display }
+//   { kind: "contact", name, number, label }
+//   { kind: "setting", id, label, path, icon, iconFont, argv }
+
+// The letter an app files under: its name's first letter, accents dropped
+// (É under E), anything that isn't A-Z under "#".
+function letterOf(name) {
+  var s = String(name || "").trim()
+  if (!s) return "#"
+  var c = s.charAt(0)
+  try { c = c.normalize("NFD").charAt(0) } catch (e) { }
+  c = c.toUpperCase()
+  return c >= "A" && c <= "Z" ? c : "#"
+}
+
+// Rows of `columns` apps, in the order given; with headers, each letter
+// starts with its header and a new row.
+function drawerRows(entries, nameOf, columns, headers) {
+  var cols = Math.max(1, Math.floor(Number(columns) || 1))
+  var list = entries || []
+  var rows = []
+  var run = null
+  var letter = null
+  for (var i = 0; i < list.length; i++) {
+    if (headers) {
+      var l = letterOf(nameOf ? nameOf(list[i]) : list[i] && list[i].name)
+      if (l !== letter) {
+        letter = l
+        rows.push({ kind: "header", label: l, letter: l })
+        run = null
+      }
+    }
+    if (!run || run.entries.length >= cols) {
+      run = { kind: "apps", entries: [], start: i, letter: letter }
+      rows.push(run)
+    }
+    run.entries.push(list[i])
+  }
+  return rows
+}
+
+// The rail's letters: each header's letter once, with the row it is on.
+function railLetters(rows) {
+  var out = []
+  var seen = {}
+  for (var i = 0; i < (rows || []).length; i++) {
+    var r = rows[i]
+    if (!r || r.kind !== "header" || seen[r.letter]) continue
+    seen[r.letter] = true
+    out.push({ letter: r.letter, row: i })
+  }
+  return out
+}
+
+// The letters the apps start with, each once, in the apps' order: the rail.
+function appLetters(entries, nameOf) {
+  var out = []
+  var seen = {}
+  for (var i = 0; i < (entries || []).length; i++) {
+    var l = letterOf(nameOf ? nameOf(entries[i]) : entries[i] && entries[i].name)
+    if (seen[l]) continue
+    seen[l] = true
+    out.push({ letter: l })
+  }
+  return out
+}
+
+// Only the apps under one letter ("" keeps them all): the rail's filter.
+function byLetter(entries, nameOf, letter) {
+  if (!letter) return (entries || []).slice()
+  var out = []
+  for (var i = 0; i < (entries || []).length; i++)
+    if (letterOf(nameOf ? nameOf(entries[i]) : entries[i] && entries[i].name) === letter) out.push(entries[i])
+  return out
+}
+
+// The drawer's tabs: Linux apps and Android apps. An Android app is one
+// Waydroid made a desktop entry for (waydroid.<package>).
+function isAndroidApp(entry) {
+  return String((entry && entry.id) || "").indexOf("waydroid.") === 0
+}
+
+function byTab(entries, tab) {
+  var android = tab === "android"
+  var out = []
+  for (var i = 0; i < (entries || []).length; i++)
+    if (isAndroidApp(entries[i]) === android) out.push(entries[i])
+  return out
+}
+
+function countAndroid(entries) {
+  var n = 0
+  for (var i = 0; i < (entries || []).length; i++) if (isAndroidApp(entries[i])) n++
+  return n
+}
+
+// Which of `count` letters a finger at `y` on a rail of `height` points at.
+function railPick(y, height, count) {
+  if (!(count > 0) || !(height > 0)) return -1
+  return Math.max(0, Math.min(count - 1, Math.floor(Number(y) / height * count)))
+}
+
+// A search's rows, first row first (the drawer stacks them upward from the
+// input, so the first sits by the thumb): the calculator's answer, the apps,
+// then contacts and settings, each under its header.
+function searchRows(apps, columns, calc, contacts, settings) {
+  var rows = []
+  if (calc) rows.push({ kind: "calc", expression: calc.expression, value: calc.value, display: calc.display })
+  var appRows = drawerRows(apps, null, columns, false)
+  for (var i = 0; i < appRows.length; i++) rows.push(appRows[i])
+  var groups = [["Contacts", contacts, "contact"], ["Settings", settings, "setting"]]
+  for (var g = 0; g < groups.length; g++) {
+    var items = groups[g][1] || []
+    if (items.length === 0) continue
+    for (var j = 0; j < items.length; j++) {
+      var row = { kind: groups[g][2] }
+      for (var k in items[j]) row[k] = items[j][k]
+      row.kind = groups[g][2]
+      rows.push(row)
+    }
+    // After its rows: stacked upward, a header shows above them.
+    rows.push({ kind: "header", label: groups[g][0], letter: "" })
+  }
+  return rows
+}
+
+// ---------------------------------------------------------------- hidden apps
+//
+// Apps hidden from the drawer: desktop ids, one per line, in
+// ~/.local/state/omamobile/launcher-hidden. A search still finds them, so
+// their menu can show them again.
+
+function parseIdList(text) {
+  var out = {}
+  var lines = String(text || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var id = lines[i].trim()
+    if (id.slice(-8) === ".desktop") id = id.slice(0, -8)
+    if (id) out[id] = true
+  }
+  return out
+}
+
+function idListText(set) {
+  var ids = []
+  for (var id in (set || {})) if (set[id]) ids.push(id)
+  ids.sort()
+  return ids.length ? ids.join("\n") + "\n" : ""
+}
+
+function withId(set, id, on) {
+  var out = {}
+  for (var k in (set || {})) if (set[k]) out[k] = true
+  if (on) out[String(id)] = true
+  else delete out[String(id)]
+  return out
+}
+
+// The drawer's apps: hidden ones only in a search.
+function visibleEntries(entries, hidden, searching) {
+  if (searching) return (entries || []).slice()
+  var out = []
+  for (var i = 0; i < (entries || []).length; i++)
+    if (!(hidden && entries[i] && hidden[entries[i].id])) out.push(entries[i])
+  return out
+}
+
+// ---------------------------------------------------------------- calculator
+//
+// Arithmetic typed into the search: numbers, + - * / ^, parentheses, a
+// trailing % (a hundredth), sqrt/√, abs, ln, log (base 10), pi/π and e.
+// Only text with an operation in it counts ("42" is a search, "6*7" a sum);
+// a leading "=" asks for the answer anyway. Never eval: a parser of its own.
+var CALC_FUNCTIONS = {
+  sqrt: Math.sqrt, abs: Math.abs, ln: Math.log,
+  log: function(x) { return Math.log10 ? Math.log10(x) : Math.log(x) / Math.LN10 }
+}
+var CALC_CONSTANTS = { pi: Math.PI, "π": Math.PI, e: Math.E }
+
+function calcTokens(text) {
+  var src = String(text).replace(/[×✕]/g, "*").replace(/÷/g, "/").replace(/[−–]/g, "-").replace(/\*\*/g, "^")
+  var tokens = []
+  var i = 0
+  while (i < src.length) {
+    var c = src.charAt(i)
+    if (/\s/.test(c)) { i++; continue }
+    var num = /^(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?/.exec(src.slice(i))
+    if (num) { tokens.push({ t: "num", v: parseFloat(num[0]) }); i += num[0].length; continue }
+    var word = /^([a-zA-Z]+|π|√)/.exec(src.slice(i))
+    if (word) {
+      var w = word[0].toLowerCase()
+      if (w === "√") tokens.push({ t: "fn", v: "sqrt" })
+      else if (CALC_FUNCTIONS[w]) tokens.push({ t: "fn", v: w })
+      else if (CALC_CONSTANTS[w] !== undefined) tokens.push({ t: "num", v: CALC_CONSTANTS[w], c: true })
+      else return null
+      i += word[0].length
+      continue
+    }
+    if ("+-*/^%()".indexOf(c) >= 0) { tokens.push({ t: c }); i++; continue }
+    return null
+  }
+  return tokens
+}
+
+// Recursive descent: sum := term (± term)*, term := unary (*|/ unary)*,
+// unary := ± unary | power, power := postfix (^ unary)?, postfix := atom %*,
+// atom := number | ( sum ) | fn atom.
+function calculate(text) {
+  var raw = String(text || "").trim()
+  var forced = raw.charAt(0) === "="
+  if (forced) raw = raw.slice(1).trim()
+  if (!raw || raw.length > 200) return null
+  // A phone number (555-1234, +49 151 2345678) is a contact search.
+  if (!forced && /^\+?[0-9][0-9 ()-]*$/.test(raw) && raw.replace(/[^0-9]/g, "").length >= 7) return null
+  var tokens = calcTokens(raw)
+  if (!tokens || tokens.length === 0) return null
+  var pos = 0
+  var ops = 0
+  function peek() { return tokens[pos] }
+  function take(t) { if (tokens[pos] && tokens[pos].t === t) { pos++; return true } return false }
+  function atom() {
+    var tok = tokens[pos]
+    if (!tok) throw "end"
+    if (tok.t === "num") { pos++; return tok.v }
+    if (tok.t === "fn") { pos++; ops++; return CALC_FUNCTIONS[tok.v](postfix()) }
+    if (take("(")) { var v = sum(); if (!take(")")) throw "paren"; return v }
+    throw "atom"
+  }
+  function postfix() {
+    var v = atom()
+    while (take("%")) { v = v / 100; ops++ }
+    return v
+  }
+  function power() {
+    var base = postfix()
+    if (take("^")) { ops++; return Math.pow(base, unary()) }
+    return base
+  }
+  function unary() {
+    if (take("-")) return -unary()
+    if (take("+")) return unary()
+    return power()
+  }
+  function term() {
+    var v = unary()
+    for (;;) {
+      if (take("*")) { ops++; v *= unary() }
+      else if (take("/")) { ops++; v /= unary() }
+      else if (peek() && (peek().t === "(" || peek().t === "fn" || (peek().t === "num" && peek().c))) { ops++; v *= unary() }
+      else return v
+    }
+  }
+  function sum() {
+    var v = term()
+    for (;;) {
+      if (take("+")) { ops++; v += term() }
+      else if (take("-")) { ops++; v -= term() }
+      else return v
+    }
+  }
+  var value
+  try { value = sum() } catch (e) { return null }
+  if (pos !== tokens.length || (!forced && ops === 0) || typeof value !== "number" || !isFinite(value)) return null
+  return { expression: raw, value: value, display: formatNumber(value) }
+}
+
+// 12 significant digits, no trailing zeros, no "-0".
+function formatNumber(value) {
+  if (value === 0) return "0"
+  if (Number.isInteger(value) && Math.abs(value) < 1e15) return String(value)
+  var s = Number(value.toPrecision(12)).toString()
+  return s === "-0" ? "0" : s
+}
+
+// ---------------------------------------------------------------- search
+//
+// Contacts and settings in a search, besides apps. Folded for matching:
+// lower case, accents dropped, punctuation as spaces.
+function fold(text) {
+  var s = String(text || "")
+  try { s = s.normalize("NFD").replace(/[̀-ͯ]/g, "") } catch (e) { }
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+}
+
+// How well text matches the query, 0 for not at all: the whole text starts
+// with it (3), a word does (2), it is inside (1).
+function matchScore(text, query) {
+  var t = fold(text)
+  var q = fold(query)
+  if (!q || !t) return 0
+  if (t.indexOf(q) === 0) return 3
+  if ((" " + t).indexOf(" " + q) >= 0) return 2
+  if (t.indexOf(q) >= 0) return 1
+  // Without the spaces: "wifi" is "Wi-Fi", "wi fi" is "WiFi".
+  var tc = t.replace(/ /g, "")
+  var qc = q.replace(/ /g, "")
+  if (tc.indexOf(qc) === 0) return 3
+  return tc.indexOf(qc) >= 0 ? 1 : 0
+}
+
+// The drawer's header in a search: what it found ("7 apps · 2 settings").
+function resultsSummary(apps, calc, contacts, settings) {
+  var parts = []
+  var count = function(n, one, many) { if (n > 0) parts.push(n + " " + (n === 1 ? one : many)) }
+  count(apps, "app", "apps")
+  count(contacts, "contact", "contacts")
+  count(settings, "setting", "settings")
+  if (parts.length === 0) return calc ? "Calculator" : "No results"
+  return parts.join(" · ")
+}
+
+// contacts: [{ name, numbers: [{ label, number }] }]. A name matches by its
+// words; a query of three or more digits matches inside a number. One row
+// per contact: the number that matched, else the first.
+function matchContacts(contacts, query, limit) {
+  var q = String(query || "").trim()
+  if (q.length < 2) return []
+  var digits = q.replace(/[^0-9]/g, "")
+  var byDigits = digits.length >= 3 && /^[0-9+()\s.-]+$/.test(q)
+  var hits = []
+  for (var i = 0; i < (contacts || []).length; i++) {
+    var c = contacts[i]
+    if (!c || !c.numbers || c.numbers.length === 0) continue
+    var score = matchScore(c.name, q)
+    var pick = c.numbers[0]
+    if (byDigits) {
+      for (var j = 0; j < c.numbers.length; j++) {
+        if (String(c.numbers[j].number || "").replace(/[^0-9]/g, "").indexOf(digits) >= 0) { score = Math.max(score, 2); pick = c.numbers[j]; break }
+      }
+    }
+    if (score > 0) hits.push({ score: score, name: String(c.name || pick.number), number: String(pick.number), label: String(pick.label || "") })
+  }
+  hits.sort(function(a, b) { return b.score - a.score || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) })
+  return hits.slice(0, Math.max(0, limit || 3)).map(function(h) { return { name: h.name, number: h.number, label: h.label } })
+}
+
+// settings: [{ id, label, path, icon, iconFont, terms: [...], argv }]. The
+// label counts most; the menu path, aliases and description less.
+function matchSettings(settings, query, limit) {
+  var q = String(query || "").trim()
+  if (fold(q).length < 2) return []
+  var hits = []
+  for (var i = 0; i < (settings || []).length; i++) {
+    var s = settings[i]
+    if (!s || !s.label || !s.argv) continue
+    var score = matchScore(s.label, q) * 2
+    var terms = s.terms || []
+    for (var j = 0; score < 2 && j < terms.length; j++) score = Math.max(score, matchScore(terms[j], q) > 1 ? 1 : 0)
+    if (score > 0) hits.push({ score: score, depth: String(s.path || "").length, s: s })
+  }
+  hits.sort(function(a, b) { return b.score - a.score || a.depth - b.depth })
+  return hits.slice(0, Math.max(0, limit || 4)).map(function(h) {
+    return { id: h.s.id, label: h.s.label, path: h.s.path || "", icon: h.s.icon || "", iconFont: h.s.iconFont || "", argv: h.s.argv }
+  })
+}
+
+// What Enter does with the text typed: "agent" (a prompt), "calc" (copy the
+// answer), "app" (the first app), "contact", "setting", or "" for nothing.
+function enterAction(promptMode, calc, apps, contacts, settings) {
+  if (promptMode) return "agent"
+  if (calc) return "calc"
+  if (apps && apps.length) return "app"
+  if (contacts && contacts.length) return "contact"
+  if (settings && settings.length) return "setting"
+  return "agent"
+}
+
+// A contact's number opens Phone's dialpad filled in (it never dials by
+// itself) or a Messages thread.
+function contactArgv(number, messages) {
+  var n = String(number || "").replace(/[^0-9+*#]/g, "")
+  return [LAUNCH, "cmd", "--"].concat(messages ? ["omamessages", "sms:" + n] : ["omaphone", "tel:" + n])
+}
+
+// A desktop action (Chromium's New Incognito Window), through
+// omamobile-launch, without the field codes (%u, %F) left for a launcher.
+function actionArgv(command) {
+  var words = (command || []).filter(function(w) { return !/^%[a-zA-Z]$/.test(String(w)) })
+  return words.length ? [LAUNCH, "cmd", "--"].concat(words.map(String)) : []
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
+    letterOf: letterOf,
+    drawerRows: drawerRows,
+    railLetters: railLetters,
+    appLetters: appLetters,
+    isAndroidApp: isAndroidApp,
+    byTab: byTab,
+    countAndroid: countAndroid,
+    byLetter: byLetter,
+    railPick: railPick,
+    searchRows: searchRows,
+    parseIdList: parseIdList,
+    idListText: idListText,
+    withId: withId,
+    visibleEntries: visibleEntries,
+    calculate: calculate,
+    formatNumber: formatNumber,
+    fold: fold,
+    matchScore: matchScore,
+    resultsSummary: resultsSummary,
+    matchContacts: matchContacts,
+    matchSettings: matchSettings,
+    enterAction: enterAction,
+    contactArgv: contactArgv,
+    actionArgv: actionArgv,
     drawerColumns: drawerColumns,
     mergedSettings: mergedSettings,
     argv: argv,

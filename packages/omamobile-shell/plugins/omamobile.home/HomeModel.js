@@ -256,13 +256,43 @@ function widgetTypes() {
 }
 
 // The span limits of an item on a given grid.
+// A widget's sizes (min, max, size) are cells of the design grid, GRID's
+// 4 columns by 6 rows. A finer grid (5 or 6 columns, 7 or 8 rows) has more,
+// smaller cells, so the largest size scales with it: a widget that may span
+// the design grid's width spans a 6-column grid's too. Before, the clock's
+// 4 stayed 4 and no widget could be resized onto the columns a 5- or
+// 6-column grid added. The smallest size is left alone (a layout made at
+// one density keeps its items when the grid gets finer), and a coarser grid
+// only caps what doesn't fit.
+function gridScale(grid) {
+  return {
+    w: Math.max(1, (Number(grid && grid.columns) || GRID.columns) / GRID.columns),
+    h: Math.max(1, (Number(grid && grid.rows) || GRID.rows) / GRID.rows)
+  }
+}
+
+function scaledSpan(span, scale) {
+  return Math.ceil(span * scale - 1e-9)
+}
+
 function sizeLimits(item, grid, catalog) {
   if (!item || item.kind !== "widget") return { minW: 1, minH: 1, maxW: 1, maxH: 1 }
   var spec = specFor(item.type, catalog)
   if (!spec) return { minW: 1, minH: 1, maxW: 1, maxH: 1 }
+  var scale = gridScale(grid)
   return {
     minW: Math.min(spec.min[0], grid.columns), minH: Math.min(spec.min[1], grid.rows),
-    maxW: Math.min(spec.max[0], grid.columns), maxH: Math.min(spec.max[1], grid.rows)
+    maxW: Math.min(scaledSpan(spec.max[0], scale.w), grid.columns), maxH: Math.min(scaledSpan(spec.max[1], scale.h), grid.rows)
+  }
+}
+
+// A new widget's size on this grid: its design size, scaled as its largest
+// is, so it takes about the same share of the screen at any density.
+function startSize(spec, grid) {
+  var scale = gridScale(grid)
+  return {
+    w: Math.max(Math.min(spec.min[0], grid.columns), Math.min(Math.round(spec.size[0] * scale.w), grid.columns)),
+    h: Math.max(Math.min(spec.min[1], grid.rows), Math.min(Math.round(spec.size[1] * scale.h), grid.rows))
   }
 }
 
@@ -408,7 +438,7 @@ function fitPages(raw, grid, catalog) {
     for (var i = 0; i < items.length; i++) {
       var item = cleanItem(items[i], grid, catalog)
       if (!item) continue
-      if (!item.id || seen[item.id]) item.id = takeId(layout, item.kind === "app" ? "a" : "w")
+      if (!item.id || seen[item.id]) item.id = takeId(layout, item.kind === "app" ? "a" : item.kind === "folder" ? "f" : "w")
       seen[item.id] = true
       if (isFree(page.items, grid, item, null)) page.items.push(item)
       else homeless.push({ page: p, item: item })
@@ -435,6 +465,19 @@ function cleanItem(raw, grid, catalog) {
   if (raw.kind === "app") {
     item.app = normalizeAppId(raw.app)
     if (!item.app) return null
+    item.w = 1; item.h = 1
+  } else if (raw.kind === "folder") {
+    // A folder: a name and its apps, in one cell. Each app once; an empty
+    // folder is dropped, and a folder of one app is that app again.
+    var apps = folderApps(raw.apps)
+    if (apps.length === 0) return null
+    if (apps.length === 1) {
+      item.kind = "app"
+      item.app = apps[0]
+    } else {
+      item.name = folderName(raw.name)
+      item.apps = apps
+    }
     item.w = 1; item.h = 1
   } else if (raw.kind === "widget") {
     // A port from before the OWL built-ins becomes its OWL original, in the
@@ -497,6 +540,7 @@ function serialize(layout) {
                 return { items: page.items.map(function(item) {
                   var o = { id: item.id, kind: item.kind }
                   if (item.kind === "app") o.app = item.app
+                  else if (item.kind === "folder") { o.name = item.name; o.apps = item.apps.slice() }
                   else { o.type = item.type }
                   o.x = item.x; o.y = item.y; o.w = item.w; o.h = item.h
                   if (item.kind === "widget") o.config = item.config
@@ -530,7 +574,10 @@ function missingApps(layout, availableApps) {
   ;(availableApps || []).forEach(function(id) { have[normalizeAppId(id)] = true })
   var out = []
   layout.pages.forEach(function(page) {
-    page.items.forEach(function(item) { if (item.kind === "app" && !have[item.app]) out.push(item.app) })
+    page.items.forEach(function(item) {
+      if (item.kind === "app" && !have[item.app]) out.push(item.app)
+      if (item.kind === "folder") item.apps.forEach(function(app) { if (!have[app]) out.push(app) })
+    })
   })
   return out
 }
@@ -573,9 +620,9 @@ function addWidget(layout, pageIndex, type, catalog) {
   var spec = specFor(type, catalog)
   if (!spec) return null
   var out = copy(layout)
+  var start = startSize(spec, out.grid)
   var item = { id: takeId(out, "w"), kind: "widget", type: type, x: -1, y: -1,
-               w: Math.min(spec.size[0], out.grid.columns), h: Math.min(spec.size[1], out.grid.rows),
-               config: copy(spec.config) }
+               w: start.w, h: start.h, config: copy(spec.config) }
   out = placeOn(out, pageIndex, item)
   if (out.placed) out.placed.id = item.id
   return out
@@ -659,6 +706,103 @@ function moveItem(layout, id, pageIndex, x, y) {
   out.pages[page].items.push(item)
   out.moved = page !== found.page || spot.x !== found.item.x || spot.y !== found.item.y
   return out
+}
+
+// ---------------------------------------------------------------- folders
+//
+// A folder is one cell holding apps: { kind: "folder", name, apps: [app
+// ids] }. Dropping an app onto an app (edit mode) makes one where the app
+// it was dropped on was; dropping an app onto a folder adds it. A folder
+// left with one app becomes that app again, and an empty one goes.
+
+var FOLDER_NAME = "Folder"
+var FOLDER_MAX_APPS = 24
+
+function folderName(name) {
+  var text = String(name === undefined || name === null ? "" : name).replace(/\s+/g, " ").trim().slice(0, 40)
+  return text || FOLDER_NAME
+}
+
+function folderApps(list) {
+  var out = []
+  var seen = {}
+  ;(Array.isArray(list) ? list : []).forEach(function(id) {
+    var app = normalizeAppId(id)
+    if (app && !seen[app] && out.length < FOLDER_MAX_APPS) { seen[app] = true; out.push(app) }
+  })
+  return out
+}
+
+// What a drop of item dragId onto item targetId would do: "folder" (an app
+// onto an app), "add" (an app onto a folder), or "" (nothing: a widget, a
+// folder dragged, itself, or an app the folder has already).
+function dropKind(layout, dragId, targetId) {
+  if (!dragId || dragId === targetId) return ""
+  var drag = findItem(layout, dragId), target = findItem(layout, targetId)
+  if (!drag || !target || drag.item.kind !== "app") return ""
+  if (target.item.kind === "app") return "folder"
+  if (target.item.kind === "folder" && target.item.apps.indexOf(drag.item.app) < 0
+      && target.item.apps.length < FOLDER_MAX_APPS) return "add"
+  return ""
+}
+
+// The drop itself; the layout unchanged when dropKind says nothing.
+// result.folder is the folder's id.
+function dropOnto(layout, dragId, targetId) {
+  var kind = dropKind(layout, dragId, targetId)
+  if (!kind) return layout
+  var out = copy(layout)
+  var drag = findItem(out, dragId)
+  var app = drag.item.app
+  out.pages[drag.page].items.splice(drag.index, 1)
+  var target = findItem(out, targetId)
+  var t = out.pages[target.page].items[target.index]
+  if (kind === "folder") {
+    var id = takeId(out, "f")
+    out.pages[target.page].items[target.index] = { id: id, kind: "folder", name: FOLDER_NAME,
+                                                   apps: [t.app, app], x: t.x, y: t.y, w: 1, h: 1 }
+    out.folder = id
+  } else {
+    t.apps.push(app)
+    out.folder = t.id
+  }
+  return out
+}
+
+function renameFolder(layout, id, name) {
+  var found = findItem(layout, id)
+  if (!found || found.item.kind !== "folder") return layout
+  var out = copy(layout)
+  out.pages[found.page].items[found.index].name = folderName(name)
+  return out
+}
+
+// Take an app out of a folder onto the folder's page (its first free cell,
+// else the next page with room). A folder left with one app becomes it.
+// result.placed is null (layout unchanged) when there is no room anywhere.
+function takeOutOfFolder(layout, folderId, appId) {
+  var found = findItem(layout, folderId)
+  var app = normalizeAppId(appId)
+  if (!found || found.item.kind !== "folder" || found.item.apps.indexOf(app) < 0) return layout
+  var out = copy(layout)
+  var folder = out.pages[found.page].items[found.index]
+  folder.apps = folder.apps.filter(function(a) { return a !== app })
+  if (folder.apps.length === 1)
+    out.pages[found.page].items[found.index] = { id: folder.id, kind: "app", app: folder.apps[0], x: folder.x, y: folder.y, w: 1, h: 1 }
+  var item = { id: takeId(out, "a"), kind: "app", app: app, x: -1, y: -1, w: 1, h: 1 }
+  var placed = placeOn(out, found.page, item)
+  if (!placed.placed) { var same = copy(layout); same.placed = null; return same }
+  placed.placed.id = item.id
+  return placed
+}
+
+// The item whose box holds cell (x, y) on a page's items, skipping ignoreId.
+function itemAtCell(items, x, y, ignoreId) {
+  for (var i = 0; i < (items || []).length; i++) {
+    var it = items[i]
+    if (it.id !== ignoreId && x >= it.x && x < it.x + it.w && y >= it.y && y < it.y + it.h) return it
+  }
+  return null
 }
 
 // Resize a widget to w x h cells, clamped to its limits and the grid edge.
@@ -1119,6 +1263,9 @@ if (typeof module !== "undefined") {
     USER_PREFIX: USER_PREFIX, USER_ID_RE: USER_ID_RE, MISSING_SPEC: MISSING_SPEC, isUserType: isUserType,
     specFor: specFor, mergeUserConfig: mergeUserConfig, removeWidgetType: removeWidgetType,
     widgetSpec: widgetSpec, widgetTypes: widgetTypes, systemTimeFormat: systemTimeFormat, sizeLimits: sizeLimits,
+    startSize: startSize,
+    FOLDER_NAME: FOLDER_NAME, FOLDER_MAX_APPS: FOLDER_MAX_APPS, folderName: folderName, folderApps: folderApps,
+    dropKind: dropKind, dropOnto: dropOnto, renameFolder: renameFolder, takeOutOfFolder: takeOutOfFolder, itemAtCell: itemAtCell,
     overlaps: overlaps, fits: fits, collision: collision, isFree: isFree, freeSpot: freeSpot,
     nearestFreeSpot: nearestFreeSpot, cellForPoint: cellForPoint, pageShift: pageShift,
     emptyLayout: emptyLayout, defaultLayout: defaultLayout, normalizeAppId: normalizeAppId,

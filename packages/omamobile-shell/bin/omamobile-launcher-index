@@ -1,0 +1,329 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""What the app drawer's search and its app menu read (omamobile.launcher).
+
+  omamobile-launcher-index settings      the settings a search can open, as JSON
+  omamobile-launcher-index contacts      the address book's names and numbers
+  omamobile-launcher-index app-info ID   a desktop entry's file, package and size
+
+Settings are the rows of Omarchy's menu (the shipped omarchy-menu.jsonc with
+the user's extension over it, merged by id as the menu does) under the roots
+a phone's Settings has: Setup, Appearance, Trigger, Update, Learn, About. A
+row whose `when` condition, or an ancestor's, fails is left out, as the menu
+hides it. Each row opens through `omarchy-menu summon ID`: a submenu opens,
+an action runs, a link follows its target. The phone's own pages that aren't
+menu rows (the Wi-Fi and Bluetooth pages of quick settings) come first.
+
+Contacts are the vCards in ~/.local/share/contacts/*/ (the vdir that Phone,
+Contacts and Messages read): FN and every TEL.
+
+Everything is read-only, and nothing here is printed but names, labels,
+numbers and paths. Errors print an empty result.
+"""
+import concurrent.futures
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+ROOTS = ("setup", "appearance", "trigger", "update", "learn", "about")
+WHEN_TIMEOUT = 3
+
+
+def omarchy_path():
+    return os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy"
+
+
+# ---------------------------------------------------------------- settings
+
+
+def strip_jsonc(text):
+    """JSONC to JSON: comments outside strings and trailing commas go."""
+    out = []
+    i, n, in_string = 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+            out.append(c)
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def read_menu(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.loads(strip_jsonc(f.read()))
+    except (OSError, ValueError):
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("items"), dict):
+        data = data["items"]
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def merged_menu():
+    items = {}
+    paths = [os.path.join(omarchy_path(), "default/omarchy/omarchy-menu.jsonc"),
+             os.path.expanduser("~/.config/omarchy/extensions/omarchy-menu.jsonc")]
+    for path in paths:
+        for key, entry in read_menu(path).items():
+            items[key] = {**items.get(key, {}), **entry}
+    return items
+
+
+def condition_holds(condition):
+    condition = str(condition or "").strip()
+    if not condition or condition == "true":
+        return True
+    if condition == "false":
+        return False
+    try:
+        return subprocess.run(["bash", "-c", condition], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=WHEN_TIMEOUT).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def as_list(value):
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    return [str(value)] if value else []
+
+
+def phone_pages():
+    pages = [
+        {"id": "omamobile.wifi", "label": "Wi-Fi", "icon": "󰖩", "path": "Quick settings",
+         "terms": ["wifi", "wlan", "wireless", "network", "internet"],
+         "argv": ["omarchy-shell", "shell", "summon", "omamobile.quicksettings", '{"page":"wifi"}']},
+        {"id": "omamobile.bluetooth", "label": "Bluetooth", "icon": "󰂯", "path": "Quick settings",
+         "terms": ["bluetooth", "pair", "headphones", "earbuds"],
+         "argv": ["omarchy-shell", "shell", "summon", "omamobile.quicksettings", '{"page":"bluetooth"}']},
+    ]
+    # The native Settings app's pages (omamobile-settings), where installed.
+    if shutil.which("omamobile-settings"):
+        pages += [
+            {"id": "omamobile.settings.display", "label": "Display", "icon": "󰃟", "path": "Settings",
+             "terms": ["brightness", "refresh rate", "screen", "hz"],
+             "argv": ["omamobile-launch", "cmd", "--", "omamobile-settings", "--page", "display"]},
+            {"id": "omamobile.settings.about", "label": "About phone", "icon": "󰋽", "path": "Settings",
+             "terms": ["about", "device", "model", "version", "kernel", "storage", "memory"],
+             "argv": ["omamobile-launch", "cmd", "--", "omamobile-settings", "--page", "about"]},
+        ]
+    return pages
+
+
+def settings():
+    items = merged_menu()
+    rows = []
+    wanted = [k for k in items if k.split(".")[0] in ROOTS]
+    # Every condition on the way down: the row's own and its ancestors'.
+    conditions = set()
+    for key in wanted:
+        parts = key.split(".")
+        for depth in range(1, len(parts) + 1):
+            conditions.add(str(items.get(".".join(parts[:depth]), {}).get("when", "") or ""))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        holds = dict(zip(conditions, pool.map(condition_holds, conditions)))
+    for key in wanted:
+        entry = items[key]
+        parts = key.split(".")
+        chain = [".".join(parts[:d]) for d in range(1, len(parts) + 1)]
+        if not all(holds.get(str(items.get(c, {}).get("when", "") or ""), False) for c in chain):
+            continue
+        label = str(entry.get("label") or "").strip()
+        if not label:
+            continue
+        path = " › ".join(str(items.get(c, {}).get("label") or c.split(".")[-1]) for c in chain[:-1])
+        rows.append({
+            "id": key,
+            "label": label,
+            "path": path,
+            "icon": str(entry.get("icon") or ""),
+            "iconFont": str(entry.get("iconFont") or ""),
+            "terms": as_list(entry.get("aliases")) + as_list(entry.get("searchTerms")) + as_list(entry.get("description")) + [path],
+            "argv": ["omarchy-menu", "summon", key],
+        })
+    return {"settings": phone_pages() + rows}
+
+
+# ---------------------------------------------------------------- contacts
+
+
+def unfold(text):
+    """vCard lines, with folded continuation lines joined (RFC 6350 3.2)."""
+    return re.sub(r"\r?\n[ \t]", "", text).splitlines()
+
+
+def vcard_value(value):
+    return value.replace("\\,", ",").replace("\\;", ";").replace("\\n", " ").replace("\\\\", "\\").strip()
+
+
+TEL_LABELS = {"cell": "Mobile", "mobile": "Mobile", "home": "Home", "work": "Work", "main": "Main", "fax": "Fax"}
+
+
+def parse_vcards(text):
+    cards, card = [], None
+    for line in unfold(text):
+        upper = line.upper()
+        if upper.startswith("BEGIN:VCARD"):
+            card = {"name": "", "n": "", "org": "", "numbers": []}
+        elif upper.startswith("END:VCARD"):
+            if card is not None:
+                name = card["name"] or card["n"] or card["org"]
+                if card["numbers"]:
+                    cards.append({"name": name, "numbers": card["numbers"]})
+            card = None
+        elif card is not None and ":" in line:
+            head, value = line.split(":", 1)
+            params = head.split(";")
+            prop = params[0].split(".")[-1].upper()
+            if prop == "FN":
+                card["name"] = vcard_value(value)
+            elif prop == "N":
+                parts = [vcard_value(p) for p in value.split(";")]
+                card["n"] = " ".join(p for p in (parts[1:2] + parts[:1]) if p)
+            elif prop == "ORG":
+                card["org"] = vcard_value(value.split(";")[0])
+            elif prop == "TEL":
+                number = vcard_value(value)
+                if number.lower().startswith("tel:"):
+                    number = number[4:]
+                types = ",".join(p.split("=", 1)[-1] for p in params[1:]).lower()
+                label = next((TEL_LABELS[t] for t in re.split(r"[,\s]+", types) if t in TEL_LABELS), "")
+                if number:
+                    card["numbers"].append({"label": label, "number": number})
+    return cards
+
+
+def contacts():
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    out = []
+    for path in sorted(glob.glob(os.path.join(home, "contacts", "*", "*.vcf"))):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out.extend(parse_vcards(f.read()))
+        except OSError:
+            continue
+    out.sort(key=lambda c: c["name"].lower())
+    return {"contacts": out}
+
+
+# ---------------------------------------------------------------- app info
+
+
+def desktop_dirs():
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    data = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return [os.path.join(home, "applications")] + [os.path.join(d, "applications") for d in data.split(":") if d]
+
+
+def find_desktop_file(desktop_id):
+    name = desktop_id if desktop_id.endswith(".desktop") else desktop_id + ".desktop"
+    for d in desktop_dirs():
+        candidate = os.path.join(d, name)
+        if os.path.isfile(candidate):
+            return candidate
+        # Ids from subdirectories: kde-foo.desktop is kde/foo.desktop.
+        if "-" in name:
+            nested = os.path.join(d, *name.split("-", 1))
+            if os.path.isfile(nested):
+                return nested
+    return ""
+
+
+def run(argv):
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def app_info(desktop_id):
+    desktop_id = re.sub(r"\.desktop$", "", desktop_id or "")
+    path = find_desktop_file(desktop_id)
+    info = {"id": desktop_id, "file": path, "source": "", "package": "", "version": "", "size": "", "exec": ""}
+    if path:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                section = ""
+                for line in f:
+                    line = line.rstrip("\n")
+                    if line.startswith("["):
+                        section = line
+                    elif section == "[Desktop Entry]" and line.startswith("Exec=") and not info["exec"]:
+                        info["exec"] = line[5:]
+        except OSError:
+            pass
+    if desktop_id.startswith("waydroid."):
+        info.update(source="Android (Waydroid)", package=desktop_id[len("waydroid."):])
+        return info
+    if path and shutil.which("pacman"):
+        owner = run(["pacman", "-Qqo", path]).split()
+        if owner:
+            info.update(source="Package", package=owner[0])
+            for line in run(["pacman", "-Qi", owner[0]]).splitlines():
+                key, _, value = line.partition(":")
+                if key.strip() == "Version":
+                    info["version"] = value.strip()
+                elif key.strip() == "Installed Size":
+                    info["size"] = value.strip()
+            return info
+    if shutil.which("flatpak") and run(["flatpak", "info", desktop_id]):
+        info.update(source="Flatpak", package=desktop_id)
+        for line in run(["flatpak", "info", desktop_id]).splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "Version":
+                info["version"] = value.strip()
+            elif key.strip() == "Installed":
+                info["size"] = value.strip()
+        return info
+    if "omarchy-launch-webapp" in info["exec"] or "omarchy-webapp-handler" in info["exec"]:
+        info["source"] = "Web app"
+    elif path.startswith(desktop_dirs()[0] + os.sep):
+        info["source"] = "Your launcher entry"
+    return info
+
+
+def main(argv):
+    what = argv[1] if len(argv) > 1 else ""
+    try:
+        if what == "settings":
+            result = settings()
+        elif what == "contacts":
+            result = contacts()
+        elif what == "app-info" and len(argv) > 2:
+            result = app_info(argv[2])
+        else:
+            print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+            return 2
+    except Exception as error:  # noqa: BLE001 (the drawer reads an empty result)
+        print("omamobile-launcher-index: %s" % error, file=sys.stderr)
+        result = {}
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

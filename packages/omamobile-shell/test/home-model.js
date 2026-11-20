@@ -78,13 +78,95 @@ test("serialize keeps only stored fields", () => {
   assert.deepStrictEqual(Object.keys(raw.pages[0].items[0]).sort(), ["app", "h", "id", "kind", "w", "x", "y"])
 })
 
+test("folders: an app dropped on an app makes one, on a folder joins it", () => {
+  const base = M.normalize({ grid: { columns: 4, rows: 6 }, nextId: 10, pages: [{ items: [
+    app("a1", 0, 1, { app: "foot" }), app("a2", 1, 1, { app: "chromium" }), app("a3", 2, 1, { app: "org.gnome.Nautilus" }), widget("w1", "clock", 0, 0, 4, 1)] }] })
+  assert.strictEqual(M.dropKind(base, "a1", "a2"), "folder")
+  assert.strictEqual(M.dropKind(base, "a1", "a1"), "", "not onto itself")
+  assert.strictEqual(M.dropKind(base, "w1", "a2"), "", "a widget makes no folder")
+  assert.strictEqual(M.dropKind(base, "a1", "w1"), "", "nor does an app dropped on a widget")
+  const one = M.dropOnto(base, "a1", "a2")
+  const folder = M.findItem(one, one.folder).item
+  assert.deepStrictEqual([folder.kind, folder.name, folder.apps, folder.x, folder.y], ["folder", "Folder", ["chromium", "foot"], 1, 1],
+    "where the app it was dropped on was, that app first")
+  assert.strictEqual(M.findItem(one, "a1"), null, "the dragged app is in it now")
+  assert.strictEqual(M.findItem(one, "a2"), null)
+  assert.strictEqual(M.dropKind(one, "a3", one.folder), "add")
+  const two = M.dropOnto(one, "a3", one.folder)
+  assert.deepStrictEqual(M.findItem(two, one.folder).item.apps, ["chromium", "foot", "org.gnome.Nautilus"])
+  assert.strictEqual(two.folder, one.folder)
+  // The same app twice is no addition.
+  const again = M.addApp(two, 0, "foot")
+  assert.strictEqual(M.dropKind(again, again.placed.id, one.folder), "")
+  // Unchanged when nothing can be dropped.
+  assert.strictEqual(M.dropOnto(base, "w1", "a2"), base)
+})
+
+test("folders: renamed, saved and read back, cleaned up when they shrink", () => {
+  let l = M.normalize({ grid: { columns: 4, rows: 6 }, pages: [{ items: [app("a1", 0, 0, { app: "foot" }), app("a2", 1, 0, { app: "chromium" })] }] })
+  l = M.dropOnto(l, "a1", "a2")
+  const id = l.folder
+  l = M.renameFolder(l, id, "  Web   and  terminal ")
+  assert.strictEqual(M.findItem(l, id).item.name, "Web and terminal")
+  assert.strictEqual(M.findItem(M.renameFolder(l, id, "   "), id).item.name, "Folder", "an empty name is Folder")
+  const back = M.parse(M.serialize(l), {})
+  assert.deepStrictEqual(M.findItem(back, id).item, M.findItem(l, id).item, "saved and read back whole")
+  assert.ok(id.charAt(0) === "f", "folder ids start with f: " + id)
+  // From the file: duplicates go, an empty folder goes, one app is the app.
+  const raw = M.normalize({ grid: { columns: 4, rows: 6 }, pages: [{ items: [
+    { id: "f1", kind: "folder", name: "x", apps: ["foot", "foot.desktop", "chromium"], x: 0, y: 0 },
+    { id: "f2", kind: "folder", apps: [], x: 1, y: 0 },
+    { id: "f3", kind: "folder", name: "solo", apps: ["imv"], x: 2, y: 0 }] }] })
+  assert.deepStrictEqual(M.findItem(raw, "f1").item.apps, ["foot", "chromium"])
+  assert.strictEqual(M.findItem(raw, "f2"), null)
+  assert.deepStrictEqual([M.findItem(raw, "f3").item.kind, M.findItem(raw, "f3").item.app], ["app", "imv"])
+  assert.deepStrictEqual(M.missingApps(raw, ["foot"]).sort(), ["chromium", "imv"], "a folder's missing apps count")
+})
+
+test("folders: an app taken out goes onto the page; one left is the app again", () => {
+  let l = M.normalize({ grid: { columns: 4, rows: 6 }, pages: [{ items: [app("a1", 0, 0, { app: "foot" }), app("a2", 1, 0, { app: "chromium" }), app("a3", 2, 0, { app: "imv" })] }] })
+  l = M.dropOnto(l, "a1", "a2")
+  const id = l.folder
+  l = M.dropOnto(l, "a3", id)
+  let out = M.takeOutOfFolder(l, id, "imv")
+  assert.ok(out.placed, "placed")
+  assert.strictEqual(M.findItem(out, out.placed.id).item.app, "imv")
+  assert.deepStrictEqual(M.findItem(out, id).item.apps, ["chromium", "foot"])
+  out = M.takeOutOfFolder(out, id, "foot")
+  const left = M.findItem(out, id).item
+  assert.deepStrictEqual([left.kind, left.app, left.x, left.y], ["app", "chromium", 1, 0], "the folder's last app, in its place")
+  assert.strictEqual(M.takeOutOfFolder(out, id, "foot"), out, "not a folder any more")
+})
+
+test("a finer grid lets widgets grow onto its new columns and rows", () => {
+  const clock = { kind: "widget", type: "clock" }
+  // The design grid: the clock's own 2x1 to 4x3.
+  assert.deepStrictEqual(M.sizeLimits(clock, { columns: 4, rows: 6 }, {}), { minW: 2, minH: 1, maxW: 4, maxH: 3 })
+  // 6 columns: the whole width; 8 rows: a third more height. The smallest stays.
+  assert.deepStrictEqual(M.sizeLimits(clock, { columns: 6, rows: 8 }, {}), { minW: 2, minH: 1, maxW: 6, maxH: 4 })
+  assert.deepStrictEqual(M.sizeLimits(clock, { columns: 5, rows: 6 }, {}), { minW: 2, minH: 1, maxW: 5, maxH: 3 })
+  // A coarser grid only caps.
+  assert.deepStrictEqual(M.sizeLimits(clock, { columns: 3, rows: 4 }, {}), { minW: 2, minH: 1, maxW: 3, maxH: 3 })
+  // Resizing a full-width clock onto a 6-column grid's two new columns.
+  const l = M.setGrid(M.normalize({ grid: { columns: 4, rows: 8 }, pages: [{ items: [widget("w1", "clock", 0, 0, 4, 1)] }] }), 6, 8)
+  assert.deepStrictEqual([M.findItem(l, "w1").item.w, M.findItem(l, "w1").item.h], [4, 1], "a finer grid moves nothing by itself")
+  const wide = M.resizeItem(l, "w1", 6, 2)
+  assert.deepStrictEqual([M.findItem(wide, "w1").item.w, M.findItem(wide, "w1").item.h], [6, 2])
+  // A new widget takes about the same share of the screen at any density.
+  assert.deepStrictEqual(M.startSize(M.widgetSpec("clock"), { columns: 6, rows: 8 }), { w: 6, h: 3 })
+  assert.deepStrictEqual(M.startSize(M.widgetSpec("clock"), { columns: 4, rows: 6 }), { w: 4, h: 2 })
+  assert.deepStrictEqual(M.startSize(M.widgetSpec("clock"), { columns: 3, rows: 4 }), { w: 3, h: 2 })
+  const added = M.addWidget(M.normalize({ grid: { columns: 6, rows: 8 }, pages: [{ items: [] }] }), 0, "clock")
+  assert.deepStrictEqual([added.pages[0].items[0].w, added.pages[0].items[0].h], [6, 3])
+})
+
 test("normalize repairs what it can", () => {
   const l = M.normalize({
     grid: { columns: 99, rows: "x" },
     nextId: 2,
     home: 7,
     pages: [{ items: [
-      widget("w1", "clock", 0, 0, 9, 9),            // too big: clamped to clock's max 4x3
+      widget("w1", "clock", 0, 0, 9, 9),            // too big: clamped to clock's max, 4x3 scaled to the 6-column grid: 6x3
       widget("w2", "nonsense", 0, 0, 1, 1),         // unknown type: dropped
       { kind: "app", app: "", x: 0, y: 0 },          // no app: dropped
       { kind: "app", app: "foot.desktop", x: 0, y: 0, id: "a9" }, // overlaps the clock: moved
@@ -94,7 +176,7 @@ test("normalize repairs what it can", () => {
   })
   assert.deepStrictEqual(l.grid, { columns: 6, rows: 6 })
   const clock = M.findItem(l, "w1").item
-  assert.deepStrictEqual([clock.w, clock.h], [4, 3])
+  assert.deepStrictEqual([clock.w, clock.h], [6, 3])
   assert.strictEqual(M.findItem(l, "w2"), null)
   const foot = l.pages[0].items.find((i) => i.app === "foot")
   assert.ok(foot && !M.overlaps(foot, clock))
