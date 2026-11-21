@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=MMS daemon (mmsd-tng)
+After=dbus.socket
+ConditionUser=!@system
+
+[Service]
+ExecStart=/usr/bin/mmsdtng
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=default.target
