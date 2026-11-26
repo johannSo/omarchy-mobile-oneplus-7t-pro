@@ -127,7 +127,8 @@ Item {
           : sheets.which === "settings" ? sheets.settingsTitle
           : sheets.which === "create" ? sheets.createTitle
           : sheets.which === "owl-approve" ? sheets.approveTitle
-          : sheets.which === "owl-store" ? sheets.storeTitle : ""
+          : sheets.which === "owl-store" ? sheets.storeTitle
+          : sheets.which === "folder" ? sheets.folderTitle : ""
         color: sheets.fg
         font.family: Style.font.family
         font.pixelSize: Style.font.heading
@@ -161,7 +162,8 @@ Item {
         : sheets.which === "settings" ? settingsSheet
         : sheets.which === "create" ? createSheet
         : sheets.which === "owl-approve" ? approveSheet
-        : sheets.which === "owl-store" ? storeSheet : null
+        : sheets.which === "owl-store" ? storeSheet
+        : sheets.which === "folder" ? folderSheet : null
     }
   }
 
@@ -925,6 +927,138 @@ Item {
           label: "Back"
           onClicked: sheets.home.sheet = "widgets"
         }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- a folder
+
+  // The folder home.folderId names (HomeModel's folder item), or null.
+  readonly property var folderItem: {
+    if (!home || which !== "folder") return null
+    var found = HomeModel.findItem(home.layout, home.folderId)
+    return found && found.item.kind === "folder" ? found.item : null
+  }
+  readonly property string folderTitle: folderItem ? folderItem.name : ""
+
+  // A folder's apps: a tap starts one, a hold takes it out onto the home
+  // screen. Its name is a field above them: what is typed is kept as the
+  // field is left or Enter is pressed (an empty name is "Folder" again).
+  Component {
+    id: folderSheet
+    Item {
+      id: folderBody
+      readonly property int columns: 4
+      readonly property real cellW: Math.floor(width / columns)
+      readonly property real cellH: Math.max(96, Style.space(100))
+      readonly property var apps: sheets.folderItem ? sheets.folderItem.apps : []
+      implicitHeight: nameField.height + Style.spacing.lg + Math.max(1, Math.ceil(apps.length / columns)) * cellH + hint.height + Style.spacing.lg
+
+      function rename() {
+        if (!sheets.folderItem) return
+        var name = HomeModel.folderName(nameField.text)
+        if (name !== sheets.folderItem.name) sheets.home.renameFolder(sheets.folderItem.id, name)
+        nameField.text = name
+      }
+
+      TextField {
+        id: nameField
+        objectName: "folderName"
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: sheets.touch
+        font.pixelSize: Style.font.title
+        foreground: sheets.fg
+        placeholderText: "Folder name"
+        text: sheets.folderItem ? sheets.folderItem.name : ""
+        Keys.onReturnPressed: { folderBody.rename(); folderGrid.forceActiveFocus() }
+        Keys.onEnterPressed: { folderBody.rename(); folderGrid.forceActiveFocus() }
+        onActiveFocusChanged: if (!activeFocus) folderBody.rename()
+      }
+
+      GridView {
+        id: folderGrid
+        objectName: "folderApps"
+        anchors.top: nameField.bottom
+        anchors.topMargin: Style.spacing.lg
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: hint.top
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        cellWidth: folderBody.cellW
+        cellHeight: folderBody.cellH
+        model: folderBody.apps
+        delegate: Item {
+          id: folderApp
+          required property var modelData
+          readonly property var desktopEntry: sheets.home.entryFor(modelData)
+          objectName: "folder-app-" + modelData
+          width: folderGrid.cellWidth
+          height: folderGrid.cellHeight
+          opacity: desktopEntry ? 1 : 0.45
+
+          Rectangle {
+            anchors.fill: parent
+            anchors.margins: Style.spacing.xs
+            radius: Style.cornerRadius
+            color: appTouch.pressed ? Style.pressedFillFor(sheets.fg, Commons.Color.accent) : "transparent"
+          }
+
+          Image {
+            id: appIcon
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: Style.spacing.xl
+            width: Math.max(40, Style.space(44))
+            height: width
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            sourceSize.width: width * Screen.devicePixelRatio
+            sourceSize.height: height * Screen.devicePixelRatio
+            source: sheets.home.appLibrary ? sheets.home.appLibrary.iconSource(folderApp.desktopEntry ? folderApp.desktopEntry.icon : "") : ""
+          }
+
+          Text {
+            anchors.top: appIcon.bottom
+            anchors.topMargin: Style.spacing.md
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.rightMargin: Style.spacing.sm
+            horizontalAlignment: Text.AlignHCenter
+            textFormat: Text.PlainText
+            text: !folderApp.desktopEntry ? folderApp.modelData
+              : sheets.home.appLibrary ? sheets.home.appLibrary.entryName(folderApp.desktopEntry) : folderApp.desktopEntry.name
+            color: sheets.fg
+            font.family: Style.font.family
+            font.pixelSize: Readable.px(Style.font.caption)
+            wrapMode: Text.Wrap
+            maximumLineCount: 2
+            elide: Text.ElideRight
+          }
+
+          MouseArea {
+            id: appTouch
+            anchors.fill: parent
+            pressAndHoldInterval: 450
+            onClicked: {
+              if (folderApp.desktopEntry) sheets.home.launchFromFolder(folderApp.modelData)
+              else sheets.home.flash("Not installed: hold to take it out")
+            }
+            onPressAndHold: sheets.home.takeOutOfFolder(sheets.folderItem.id, folderApp.modelData)
+          }
+        }
+      }
+
+      Label {
+        id: hint
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        text: "Hold an app to take it out. In edit mode, drop an app on the folder to add it."
+        font.pixelSize: Readable.px(Style.font.caption)
       }
     }
   }

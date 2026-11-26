@@ -25,11 +25,13 @@ Item {
     property Item grid: null
     property Item handle: null
     property Item input: null
+    property var baseApps: []
 
     function initTestCase() {
       var apps = []
       for (var i = 0; i < 40; i++) apps.push({ id: "app" + (i < 10 ? "0" : "") + i, name: "App " + i, icon: "" })
       harness.apps = apps
+      baseApps = apps
       sheet = findChild(harness, "drawer")
       grid = findChild(harness, "drawerGrid")
       handle = findChild(harness, "drawerHandle")
@@ -38,6 +40,9 @@ Item {
     }
 
     function init() {
+      harness.apps = baseApps
+      harness.hiddenIds = ({})
+      harness.appTab = "linux"
       harness.close()
       tryCompare(harness, "progress", 0, 3000)
       harness.calls = []
@@ -200,6 +205,247 @@ Item {
       t.press(0, view, 60, 110).commit()
       t.release(0, view, 60, 110).commit()
       tryCompare(harness, "launched", ["app00"])
+    }
+
+    // Apps under every letter from A to Z, three each, for the rail and the
+    // headers.
+    function lettered() {
+      var apps = []
+      for (var c = 0; c < 26; c++)
+        for (var i = 0; i < 3; i++) {
+          var name = String.fromCharCode(65 + c) + "pp " + i
+          apps.push({ id: "l" + String.fromCharCode(97 + c) + i, name: name, icon: "" })
+        }
+      return apps
+    }
+
+    function centreOf(item) { return item.mapToItem(view, item.width / 2, item.height / 2) }
+
+    function hold(item) {
+      var c = centreOf(item)
+      var t = touchEvent(view)
+      t.press(0, view, c.x, c.y).commit()
+      wait(700)
+      t.release(0, view, c.x, c.y).commit()
+    }
+
+    function tap(item) {
+      // A page that just changed lays out on the next frame.
+      waitForRendering(sheet)
+      wait(50)
+      var c = centreOf(item)
+      var t = touchEvent(view)
+      t.press(0, view, c.x, c.y).commit()
+      t.release(0, view, c.x, c.y).commit()
+    }
+
+    function test_browsing_shows_every_app_without_headers() {
+      harness.apps = lettered()
+      openSettled()
+      compare(findChild(grid, "section-A"), null, "no letter headers")
+      compare(grid.shownApps, 78, "every app")
+      var a = findChild(grid, "app-la0"), b = findChild(grid, "app-la1")
+      compare(a.mapToItem(sheet, 0, 0).y, b.mapToItem(sheet, 0, 0).y, "side by side in the first row")
+    }
+
+    function test_a_hold_opens_the_app_menu_and_hide_hides() {
+      openSettled()
+      var cell = findChild(grid, "app-app01")
+      hold(cell)
+      tryVerify(function() { return harness.menuEntry && harness.menuEntry.id === "app01" }, 3000, "the menu is the app's")
+      compare(harness.launched, [], "a hold launches nothing")
+      var card = findChild(harness, "appMenuCard")
+      verify(card.visible && card.height >= 44 * 4, "the card shows its rows: " + card.height)
+      verify(card.y >= cell.mapToItem(sheet, 0, cell.height).y - 1 || card.y + card.height <= cell.mapToItem(sheet, 0, 0).y + 1, "by the app, not over it")
+      tap(findChild(harness, "menuHide"))
+      verify(harness.hiddenIds["app01"], "hidden")
+      compare(harness.menuEntry, null, "the menu closed")
+      waitForRendering(sheet)
+      compare(findChild(grid, "app-app01"), null, "gone from the drawer")
+      harness.query = "App 1"
+      waitForRendering(sheet)
+      verify(findChild(grid, "app-app01"), "a search still finds it")
+    }
+
+    function test_a_tap_outside_or_back_closes_the_menu_not_the_drawer() {
+      openSettled()
+      hold(findChild(grid, "app-app02"))
+      tryVerify(function() { return harness.menuEntry !== null }, 3000)
+      var t = touchEvent(view)
+      t.press(0, view, 20, view.height - 20).commit()
+      t.release(0, view, 20, view.height - 20).commit()
+      compare(harness.menuEntry, null, "a tap on the scrim closes it")
+      verify(harness.opened, "the drawer stays")
+      hold(findChild(grid, "app-app02"))
+      tryVerify(function() { return harness.menuEntry !== null }, 3000)
+      sheet.forceActiveFocus()
+      keyClick(Qt.Key_Escape)
+      compare(harness.menuEntry, null, "Back closes the menu")
+      verify(harness.opened, "and only the menu")
+      compare(harness.calls, [])
+    }
+
+    function test_a_pull_under_the_menu_moves_nothing() {
+      openSettled()
+      hold(findChild(grid, "app-app00"))
+      tryVerify(function() { return harness.menuEntry !== null }, 3000)
+      var c = Qt.point(300, 60)
+      var t = touchEvent(view)
+      t.press(0, view, c.x, c.y).commit()
+      drag(t, c, 200, 10, 20)
+      t.release(0, view, c.x, c.y + 200).commit()
+      compare(harness.progress, 1, "the drawer stayed")
+      compare(harness.calls, [])
+    }
+
+    function test_uninstall_asks_first() {
+      openSettled()
+      hold(findChild(grid, "app-app03"))
+      tryVerify(function() { return harness.menuEntry !== null }, 3000)
+      tap(findChild(harness, "menuUninstall"))
+      compare(harness.menuPage, "uninstall", "a question first")
+      compare(harness.calls, [], "nothing removed yet")
+      tap(findChild(harness, "uninstallCancel"))
+      compare(harness.menuPage, "main", "Cancel goes back")
+      tap(findChild(harness, "menuUninstall"))
+      tap(findChild(harness, "uninstallConfirm"))
+      compare(harness.calls, ["uninstall app03", "hide"])
+    }
+
+    function test_app_info_and_add_to_home() {
+      openSettled()
+      hold(findChild(grid, "app-app04"))
+      tryVerify(function() { return harness.menuEntry !== null }, 3000)
+      tap(findChild(harness, "menuInfo"))
+      compare(harness.menuPage, "info")
+      harness.menuPage = "main"
+      tap(findChild(harness, "menuAddToHome"))
+      compare(harness.calls, ["addToHome app04", "hide"])
+    }
+
+    // Where the rail's letter `letter` is, in the view.
+    function railPoint(rail, letter) {
+      var top = rail.mapToItem(view, rail.width / 2, 0)
+      var i = rail.letters.map(function(l) { return l.letter }).indexOf(letter)
+      return Qt.point(top.x, top.y + (rail.height - rail.step * rail.letters.length) / 2 + rail.step * (i + 0.5))
+    }
+
+    function test_the_rail_shows_only_a_letters_apps() {
+      harness.apps = lettered()
+      openSettled()
+      var rail = findChild(harness, "drawerRail")
+      verify(rail.visible, "a rail with 26 letters")
+      compare(rail.letters.length, 26)
+      verify(rail.width >= 24, "rail " + rail.width)
+      // The rail covers no app: the grid ends where it starts.
+      verify(grid.mapToItem(sheet, grid.width, 0).x <= rail.mapToItem(sheet, 0, 0).x + 1, "beside the grid")
+      var m = railPoint(rail, "M")
+      var t = touchEvent(view)
+      t.press(0, view, m.x, m.y).commit()
+      tryCompare(rail, "current", "M")
+      compare(harness.letterFilter, "M", "only M's apps")
+      verify(findChild(harness, "railBubble").visible, "the letter in a bubble")
+      waitForRendering(sheet)
+      compare(grid.shownApps, 3)
+      verify(findChild(grid, "app-lm0") && !findChild(grid, "app-la0"), "M's apps, nothing else")
+      var lm = findChild(grid, "app-lm0")
+      fuzzyCompare(lm.mapToItem(grid, 0, lm.height).y, grid.height, 2, "at the bottom, by the thumb")
+      compare(findChild(grid, "app-lm1").mapToItem(grid, 0, 0).y, lm.mapToItem(grid, 0, 0).y, "in one row")
+      compare(rail.letters.length, 26, "the rail keeps every letter")
+      // Down the rail: further letters.
+      for (var i = 1; i <= 4; i++) { wait(20); t.move(0, view, m.x, m.y + rail.step * i).commit() }
+      tryCompare(harness, "letterFilter", "Q")
+      t.release(0, view, m.x, m.y + rail.step * 4).commit()
+      compare(rail.current, "", "let go")
+      compare(harness.letterFilter, "Q", "the letter stays chosen")
+      verify(findChild(harness, "showAll").visible, "with a way back to every app")
+      compare(harness.progress, 1, "a drag on the rail never pulls the drawer")
+      compare(harness.launched, [])
+      // The same letter again: every app.
+      var q = railPoint(rail, "Q")
+      t.press(0, view, q.x, q.y).commit()
+      t.release(0, view, q.x, q.y).commit()
+      compare(harness.letterFilter, "", "a tap on the chosen letter shows all")
+      waitForRendering(sheet)
+      compare(grid.shownApps, 78)
+    }
+
+    function test_show_all_back_and_a_search_clear_the_letter() {
+      harness.apps = lettered()
+      openSettled()
+      var rail = findChild(harness, "drawerRail")
+      var c = railPoint(rail, "C")
+      var t = touchEvent(view)
+      t.press(0, view, c.x, c.y).commit()
+      t.release(0, view, c.x, c.y).commit()
+      compare(harness.letterFilter, "C")
+      tap(findChild(harness, "showAll"))
+      compare(harness.letterFilter, "", "Show all")
+      t.press(0, view, c.x, c.y).commit()
+      t.release(0, view, c.x, c.y).commit()
+      sheet.forceActiveFocus()
+      keyClick(Qt.Key_Escape)
+      compare(harness.letterFilter, "", "Back clears the letter")
+      verify(harness.opened, "and leaves the drawer open")
+      t.press(0, view, c.x, c.y).commit()
+      t.release(0, view, c.x, c.y).commit()
+      compare(harness.letterFilter, "C")
+      harness.close()
+      compare(harness.letterFilter, "", "closing the drawer clears it")
+    }
+
+    // Linux apps and five Android ones (Waydroid's entries).
+    function mixed() {
+      var apps = baseApps.slice()
+      for (var i = 0; i < 5; i++) apps.push({ id: "waydroid.org.example.a" + i, name: "Droid " + i, icon: "" })
+      return apps
+    }
+
+    function test_no_tabs_without_android_apps() {
+      openSettled()
+      verify(!findChild(harness, "drawerTabs").visible, "only Linux apps: no tabs")
+      compare(grid.shownApps, 40)
+    }
+
+    function test_tabs_split_linux_and_android_apps() {
+      harness.apps = mixed()
+      openSettled()
+      var tabs = findChild(harness, "drawerTabs")
+      verify(tabs.visible, "tabs with Android apps")
+      verify(tabs.height >= 44, "a whole touch target")
+      compare(grid.shownApps, 40, "Linux first")
+      verify(findChild(grid, "app-app00") && !findChild(grid, "app-waydroid.org.example.a0"))
+      tap(findChild(harness, "tab-android"))
+      compare(harness.appTab, "android")
+      waitForRendering(sheet)
+      compare(grid.shownApps, 5)
+      verify(findChild(grid, "app-waydroid.org.example.a0") && !findChild(grid, "app-app00"), "only Android apps")
+      var rail = findChild(harness, "drawerRail")
+      compare(rail.letters.length, 1, "the rail has the tab's letters: " + JSON.stringify(rail.letters))
+      tap(findChild(harness, "tab-linux"))
+      compare(harness.appTab, "linux")
+      compare(harness.launched, [], "a tab tap launches nothing")
+    }
+
+    function test_a_sideways_swipe_changes_the_tab_and_launches_nothing() {
+      harness.apps = mixed()
+      openSettled()
+      var cell = findChild(grid, "app-app05")
+      var c = cell.mapToItem(view, cell.width / 2, cell.height / 2)
+      var t = touchEvent(view)
+      t.press(0, view, c.x, c.y).commit()
+      for (var i = 1; i <= 8; i++) { wait(16); view.now += 16; t.move(0, view, c.x - i * 15, c.y + i).commit() }
+      t.release(0, view, c.x - 120, c.y + 8).commit()
+      compare(harness.appTab, "android", "a swipe left: Android")
+      compare(harness.launched, [], "the app under the finger didn't start")
+      compare(harness.progress, 1, "nor did the drawer move")
+      waitForRendering(sheet)
+      cell = findChild(grid, "app-waydroid.org.example.a1")
+      c = cell.mapToItem(view, cell.width / 2, cell.height / 2)
+      t.press(0, view, c.x, c.y).commit()
+      for (var j = 1; j <= 8; j++) { wait(16); view.now += 16; t.move(0, view, c.x + j * 15, c.y).commit() }
+      t.release(0, view, c.x + 120, c.y).commit()
+      compare(harness.appTab, "linux", "a swipe right: Linux")
     }
 
     function test_home_swipe_opens_from_under_the_finger() {

@@ -50,7 +50,8 @@ with tempfile.TemporaryDirectory() as tmp:
     for i, bad in enumerate(('no', '1', '""', 'YES')):
         pack('INITRAMFS_CRYPT=' + bad + '\n', 'bad-crypt-' + str(i), False)
     # No shipped descriptor opts in yet: each phone does so in its own change
-    crypt_devices = set()
+    # (the OnePlus 7T Pro port's local branch: hotdog's root is LUKS2)
+    crypt_devices = {'hotdog'}
     for d in sorted((repo / 'device').glob('*/device.conf')):
         if any(line.split('#')[0].strip().startswith('INITRAMFS_CRYPT=') for line in d.read_text().splitlines()):
             assert d.parent.name in crypt_devices, d.parent.name + ' sets INITRAMFS_CRYPT'

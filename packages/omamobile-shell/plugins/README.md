@@ -15,7 +15,7 @@ logical at scale 3).
 | --- | --- | --- |
 | `omamobile.bar` | `bar` | Status bar: clock, connectivity, battery; tap or pull down for quick settings, or with `cardsOnTap` a tap on an item for its card |
 | `omamobile.quicksettings` | `panel` (keepLoaded) | Pull-down sheet: up to 21 tiles the user arranges, brightness and volume, a Settings gear, media controls and the notification history; Wi-Fi picker and Bluetooth panel |
-| `omamobile.launcher` | `panel` (keepLoaded) | Home bar: app search, app grid and coding-agent prompt in one input |
+| `omamobile.launcher` | `panel` (keepLoaded) | Home bar: app, contact and settings search, sums, the A-Z app grid with an app menu, and the coding-agent prompt in one input |
 | `omamobile.home` | `panel` (keepLoaded) | Home screens: pages of apps and widgets on the wallpaper, with an edit mode |
 | `omamobile.fingerprint` | `panel` (keepLoaded) | Fingerprint target over the sensor during verification, desktop guard, and the enrollment screen |
 | `omamobile.keyboard` | `panel` (keepLoaded) | The on-screen keyboard's show and hide calls (IPC) for the home pill and scripts, and the language sheet for the keyboard's globe key |
@@ -464,6 +464,76 @@ The home surface, after Omalauncher: one bar along the bottom of the screen.
   screen reaches the drawer in-process through `DrawerLink.js` (a
   `.pragma library` script both plugins import from the launcher's folder);
   without it the swipe still opens the drawer through the host on release.
+* **Linux and Android.** With Android apps installed (the desktop entries
+  Waydroid makes, `waydroid.<package>`), a row of two tabs under the header,
+  **Linux** and **Android**, splits the grid; a tap on a tab, or a sideways
+  swipe on the grid (left for Android, right for Linux), changes it, and the
+  tab stays for the next open. The rail and its letter work within the tab;
+  a search looks through both. Without Android apps there are no tabs.
+* **A to Z.** The grid shows every app, and an A-Z rail runs down its right
+  edge with only the letters the apps start with (accents dropped, digits
+  and symbols under `#`). Touch a letter, or drag along the rail, and the
+  grid shows only that letter's apps, stacked up from the search field by
+  the thumb as a search's results are; the letter under the finger shows
+  large in a bubble beside the rail, and the chosen one sits on an accent
+  dot. It stays chosen when the finger lifts: the header reads "C · 4 apps"
+  with a **Show all** chip, and Show all, a tap on the same letter, Back,
+  typing a search or closing the drawer brings every app back. The rail has
+  a strip of its own (the grid ends where it starts) and its touch reaches a
+  little into the grid's margin; a drag on it never pulls the drawer.
+  `alphabetRail` (below) turns it off; `sectionHeaders` adds letter headers
+  between the apps.
+* **The app menu.** Hold an app (0.45 s, a haptic tick as it takes): a card
+  opens by it, over the drawer faded back, with the app's own shortcuts (up
+  to four of its desktop entry's actions, Chromium's New Incognito Window
+  among them, started through `omamobile-launch cmd`), **Add to home**
+  (`omamobile.home addApp`, as the hold did before), **Hide from drawer**,
+  **App info** and **Uninstall**. A tap outside, Back (Escape) or closing the
+  drawer closes it; a pull under it moves nothing.
+  * **Hide** keeps the app's desktop id in
+    `~/.local/state/omamobile/launcher-hidden` (one per line, written whole
+    and moved into place). A hidden app is left out of the grid, but a search
+    still finds it, dimmed, and its menu says **Show in drawer**. Omarchy's
+    own menu and the home screen are not affected.
+  * **App info** asks `omamobile-launcher-index app-info ID`: where the
+    entry came from (a package, a Flatpak, a web app, Waydroid, the user's
+    own entry), the package, its version and installed size, what it runs
+    and the desktop file.
+  * **Uninstall** asks first ("Uninstall Foo?", Cancel or Uninstall). An
+    Android app goes through `waydroid app remove`; anything else through
+    Omarchy's own removal (`AppLibrary.remove`, which runs
+    `omarchy-remove-launcher-entry`: a web app, a TUI or the user's own entry
+    is removed, a package or a Flatpak is uninstalled in a floating terminal
+    that asks for the password).
+* **More than apps in a search.** The search also finds:
+  * **Arithmetic**: `12*7+3`, `2^10`, `200*15%`, `sqrt 2`, `3 × 4 ÷ 2` get an
+    answer row by the input, highlighted; a tap or Enter copies it
+    (`wl-copy`) with a toast. A parser of its own, never `eval`: numbers, `+ -
+    * / ^ **`, parentheses, a trailing `%`, `sqrt`/`√`, `abs`, `ln`, `log`,
+    `pi`/`π` and `e`. Text without an operation is no sum (`42` is a search),
+    a leading `=` asks anyway, and a phone number (`555-1234`) is left to
+    the contacts.
+  * **Contacts**: the address book Phone, Contacts and Messages share (the
+    vCards in `~/.local/share/contacts/*/`), by a name's words or by three or
+    more digits of a number. A tap opens Phone's dialpad with the number
+    filled in (`omaphone tel:…`, which never dials by itself); the bubble at
+    the row's end opens Messages (`omamessages sms:…`).
+  * **Settings**: the rows of Omarchy's menu under Setup, Appearance,
+    Trigger, Update, Learn and About (the shipped `omarchy-menu.jsonc` with
+    the user's extension over it, rows whose `when` fails left out), the
+    Wi-Fi and Bluetooth pages of quick settings, and the Settings app's
+    Display and About pages where it is installed. A row shows its menu path
+    and opens through `omarchy-menu summon ID` (a submenu opens, an action
+    runs). Nothing under Install, Remove or System (power off) is offered.
+
+  Results stack up from the input: the answer, the apps, then contacts and
+  settings under their headers, at most three contacts and four settings;
+  the header counts what was found ("7 apps · 2 settings"). Enter takes the
+  highlighted row: the answer, else the top app, contact or setting. Text
+  that reads as a prompt still goes to the agent (below), and text that
+  matches nothing at all does too. `omamobile-launcher-index` reads settings
+  as the drawer first opens (then after the menu files change or ten minutes
+  later) and contacts at most every half minute, in the background.
 * **Ask the agent.** Any text also offers an "Ask Claude" row above the input.
   Text that reads as a prompt (3+ words, ends in `?`, `.` or `!`, or matches no
   app) makes that row the primary action: it is highlighted, the input glyph
@@ -492,6 +562,8 @@ any of them on the plugin's entry in `shell.json`, which the launcher watches:
 | `terminalCommand` | `["xdg-terminal-exec"]` | |
 | `columns` | `4` | 3 to 6 |
 | `sentenceWords` | `3` | Word count at which text counts as a prompt |
+| `sectionHeaders` | `false` | Letter headers between the apps while browsing |
+| `alphabetRail` | `true` | The A-Z rail along the grid's right edge: a letter shows only its apps |
 
 IPC:
 
@@ -499,12 +571,12 @@ IPC:
 | --- | --- |
 | `omarchy-shell shell summon omamobile.launcher '{"query":"fix the tests"}'` | Open the drawer, optionally pre-filled |
 | `omarchy-shell shell hide omamobile.launcher` | Close the drawer (the dock stays) |
-| `omarchy-shell shell call omamobile.launcher search <text>` | Open and type; returns the mode (`apps`/`agent`) and the top app ids |
+| `omarchy-shell shell call omamobile.launcher search <text>` | Open and type; returns the mode (`apps`/`agent`), what Enter does, the top app ids, the answer and the settings found |
 | `omarchy-shell shell call omamobile.launcher ask <prompt>` | Ask the agent directly |
-| `omarchy-shell shell call omamobile.launcher state ''` | JSON: open state, query, mode, app count, agent argv |
-
-Long-press an app in the drawer to put it on the home screen
-(`omamobile.home addApp`).
+| `omarchy-shell shell call omamobile.launcher tab linux\|android` | Open the drawer on that tab |
+| `omarchy-shell shell call omamobile.launcher letter <A-Z>` | Open the drawer with only that letter's apps, as the rail does (`''` for all) |
+| `omarchy-shell shell call omamobile.launcher menu <desktop-id>` | Open that app's menu in the drawer |
+| `omarchy-shell shell call omamobile.launcher state ''` | JSON: open state, query, mode, app, hidden, settings and contact counts, the open menu, agent argv |
 
 ## One app per screen
 
@@ -586,8 +658,10 @@ wallpaper, swiped sideways, with page dots above the dock.
   `uwsm-app -- gtk-launch`, on a screen of their own). An app that is no longer
   installed stays, dimmed, until you remove it: its package may come back.
 * **Edit mode.** Long-press anywhere (empty space, an app, a widget), with a
-  finger or a held mouse button. Then drag an item to move it (dropped on an
-  item of the same size, the two swap; on a bigger one, it takes the nearest
+  finger or a held mouse button. Then drag an item to move it (an app
+  dropped on another app makes a folder of the two, and on a folder joins
+  it; a widget dropped on a widget of the same size swaps with it; on
+  anything else it takes the nearest
   free cell; dragged past the left or right edge, it moves to that page,
   making a new page on the right), drag the corner handle to resize a
   widget, tap the cross to remove (an
@@ -599,6 +673,20 @@ wallpaper, swiped sideways, with page dots above the dock.
   covered it, `patches/omarchy/0005`), **Pages** adds, removes, reorders and
   picks the home page and sets the grid size, **Done** (or a tap on empty
   space, or Escape) ends it. Swipe empty space to change page while editing.
+* **Folders.** Drop an app on another app in edit mode: the two become a
+  folder in the cell of the app it was dropped on (the drop target reads
+  "New folder", or "Add to folder" over a folder), and the folder opens so
+  it can be named. The tile shows its first four apps. A tap opens it (in
+  edit mode too): its name, a field (kept when left or on Enter; empty is
+  "Folder" again), and its apps, which start on a tap; a hold takes one out
+  onto the folder's page. A folder left with one app is that app again; the
+  cross removes the whole folder (Undo puts it back). In `home.json` a
+  folder is `{ "kind": "folder", "name": …, "apps": [desktop ids] }`, up to
+  24 apps, each once. `shell call omamobile.home folder <id>` opens one.
+* **Widget sizes follow the grid.** The sizes below are cells of the 4x6
+  design grid. On a finer grid (Pages: up to 6 columns and 8 rows) a
+  widget's largest size grows with it, so it can be resized onto the
+  columns and rows that were added; its smallest size stays.
 
 | Widget | Sizes | What it shows |
 | --- | --- | --- |

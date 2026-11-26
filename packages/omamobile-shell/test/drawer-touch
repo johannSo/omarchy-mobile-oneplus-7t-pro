@@ -46,7 +46,9 @@ window = block(src.index("  PanelWindow {\n    id: drawer"))
 window = window.replace("  PanelWindow {", "  Item {\n    anchors.fill: parent", 1)
 window = "\n".join(l for l in window.split("\n")
                    if not re.match(r"^    (anchors \{ top|exclusionMode:|WlrLayershell\.|color: \"transparent\"|mask: Region)", l))
-cell = block(src.index("  component AppCell: Item {"))
+# Every part (AppCell, SectionHeader, ResultRow, MenuRow, MenuButton).
+parts = "\n\n".join(block(m.start()) for m in re.finditer(r"^  component \w+: ", src, re.M))
+real = "\n\n".join(function(name) for name in ("entryNameOf", "rowsFor", "setTab", "browseEntries", "openAppMenu", "closeAppMenu", "entryActions", "toggleHidden"))
 
 out = """import QtQuick
 import Quickshell
@@ -89,10 +91,42 @@ Item {
   readonly property string agentIcon: ""
   property var launched: []
   function launchApp(entry) { launched = launched.concat([entry.id]); dismiss() }
-  function addToHome(entry) { }
+  function addToHome(entry) { calls = calls.concat(["addToHome " + entry.id]); closeAppMenu(); dismiss() }
   function askAgent(prompt) { }
   function activate() { }
   function refreshApps() { }
+  function refreshSources() { }
+  // Search sources and hidden apps: none read here; Hide is kept in memory.
+  readonly property bool sectionHeaders: false
+  property string letterFilter: ""
+  property string appTab: "linux"
+  readonly property int androidCount: LauncherModel.countAndroid(apps)
+  readonly property bool tabsShown: !hasQuery && androidCount > 0
+  readonly property string shownTab: androidCount > 0 ? appTab : "linux"
+  readonly property bool railEnabled: true
+  readonly property int sectionHeight: 28
+  readonly property int resultHeight: 52
+  readonly property var calcResult: null
+  readonly property var contactMatches: []
+  readonly property var settingMatches: []
+  readonly property string enterTarget: ""
+  property var hiddenIds: ({})
+  function setHidden(entry, hidden) { hiddenIds = LauncherModel.withId(hiddenIds, entry.id, hidden) }
+  function copyResult(calc) { }
+  function openContact(row, messages) { }
+  function openSetting(row) { }
+  function runEntryAction(action) { }
+  // The app menu's state, and the pages that read the system stubbed.
+  property var menuEntry: null
+  property string menuPage: "main"
+  property var menuInfo: null
+  property real menuAnchorX: 0
+  property real menuAnchorY: 0
+  property real menuAnchorH: 0
+  function showAppInfo() { menuPage = "info"; menuInfo = ({ source: "Package", package: "app", version: "1-1" }) }
+  function uninstall(entry) { calls = calls.concat(["uninstall " + entry.id]); closeAppMenu(); dismiss() }
+
+%s
 
 %s
 
@@ -106,7 +140,7 @@ Item {
 
 %s
 }
-""" % (function("open"), function("close"), function("dismiss"), position, window, cell)
+""" % (function("open"), function("close"), function("dismiss"), real, position, window, parts)
 open(sys.argv[2], "w").write(out)
 PY
 cp "$here/drawer-touch.qml" "$work/tst_drawer_touch.qml"

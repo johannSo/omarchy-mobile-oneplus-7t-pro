@@ -280,7 +280,7 @@ if [[ $rc == 77 ]]; then
 elif [[ $rc != 0 ]]; then
   printf '%s\n' "$out" | grep -vE '^(PASS|QDEBUG)' >&2; fail "the drawer under touch (test/drawer-touch)"
 else
-  pass "the drawer under touch: the handle taps and drags, a pull or a flick closes, a scrolled grid scrolls first, the home screen's swipe opens it"
+  pass "the drawer under touch: the handle taps and drags, a pull or a flick closes, a scrolled grid scrolls first, the home screen's swipe opens it, the A-Z rail shows one letter's apps, the app menu (hold, hide, uninstall asks first)"
 fi
 rc=0; out=$(bash test/home-gestures 2>&1) || rc=$?
 if [[ $rc == 77 ]]; then
@@ -428,6 +428,7 @@ if command -v node >/dev/null; then
     fi
   done
   node test/gesture-model.js >/dev/null || { node test/gesture-model.js | grep -v '^ok'; fail "home and drawer gesture rules"; }
+  node test/launcher-model.js || fail "app drawer model: rows, rail, hidden apps, calculator, search"
   node test/wifi-model.js || fail "Wi-Fi model"
   node test/bluetooth-model.js || fail "Bluetooth model"
   node test/sensor-model.js || fail "fingerprint sensor model"
@@ -855,6 +856,12 @@ pass "user widgets"
 # per-launch Hyprland exec rule, or focuses the app's open window.
 python3 -B -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' bin/omamobile-launch || fail "omamobile-launch parses"
 python3 -B test/launch.py || fail "omamobile-launch"
+# The drawer's search sources and its app info (omamobile-launcher-index).
+python3 -B -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' bin/omamobile-launcher-index || fail "omamobile-launcher-index parses"
+python3 -B test/launcher-index.py || fail "omamobile-launcher-index"
+# The app menu asks before Uninstall, and hidden apps stay findable.
+grep -c 'onClicked: root.menuPage = "uninstall"' plugins/omamobile.launcher/Launcher.qml >/dev/null || fail "Uninstall asks first"
+grep -c 'onClicked: root.uninstall(root.menuEntry)' plugins/omamobile.launcher/Launcher.qml >/dev/null || fail "only the question's answer uninstalls"
 # Nothing launches around it: not Omarchy's AppLibrary.launch, not Qt's
 # openUrlExternally (a link opened wherever the browser was), not a bare
 # gtk-launch or the agent prompt.
@@ -1477,6 +1484,7 @@ OMAMOBILE_POWER_KEY_ANDROID=1 test/keys.sh || fail "omamobile-keys, with the pow
 test/home-command.sh || fail "omamobile-home"
 test/reboot-command.sh || fail "omamobile-reboot"
 bash test/dnd-state.sh || fail "the Do Not Disturb read on Omarchy 4.5 and 4.0"
+bash test/lock-on-start.sh || fail "the lock after login, and its skip after the boot's PIN pad"
 
 # Every surface on Back's list, and the order, in Qt.
 rc=0; out=$(python3 -B test/back-surfaces.py 2>&1) || rc=$?
